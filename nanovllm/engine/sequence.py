@@ -30,6 +30,10 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
 
+        # priority scheduling
+        self.priority = sampling_params.priority
+        self.arrival_time = 0.0
+
     def __len__(self):
         return self.num_tokens
 

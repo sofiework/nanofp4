@@ -1,3 +1,4 @@
+import time
 from collections import deque
 
 from nanovllm.config import Config
@@ -16,19 +17,43 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
+        # priority scheduling
+        self.priority_deadline = config.priority_deadline
+
     def is_finished(self):
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
+        seq.arrival_time = time.monotonic()
         self.waiting.append(seq)
+
+    # effective priority: bump a normal seq to fast once it waits past the deadline (anti-starvation)
+    def _priority(self, seq: Sequence, now: float) -> int:
+        if self.priority_deadline > 0 and now - seq.arrival_time > self.priority_deadline:
+            return max(seq.priority, 1)
+        return seq.priority
+
+    # pick the next waiting seq: started (mid-chunk) first, then priority, then earliest arrival
+    def _pick_waiting(self, now: float, scheduled_seqs: list[Sequence]) -> Sequence | None:
+        best, best_key = None, None
+        for seq in self.waiting:
+            if seq in scheduled_seqs:
+                continue
+            key = (bool(seq.block_table), self._priority(seq, now), -seq.arrival_time)
+            if best_key is None or key > best_key:
+                best, best_key = seq, key
+        return best
 
     def schedule(self) -> tuple[list[Sequence], bool]:
         scheduled_seqs = []
         num_batched_tokens = 0
+        now = time.monotonic()
 
         # prefill
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.waiting[0]
+            seq = self._pick_waiting(now, scheduled_seqs)
+            if seq is None:
+                break
             remaining = self.max_num_batched_tokens - num_batched_tokens
             if remaining == 0:
                 break
@@ -47,7 +72,7 @@ class Scheduler:
             num_batched_tokens += seq.num_scheduled_tokens
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
                 seq.status = SequenceStatus.RUNNING
-                self.waiting.popleft()
+                self.waiting.remove(seq)
                 self.running.append(seq)
             scheduled_seqs.append(seq)
 
