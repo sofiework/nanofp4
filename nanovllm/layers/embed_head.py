@@ -5,7 +5,7 @@ import torch.distributed as dist
 
 from nanovllm.utils.context import get_context
 
-
+# token id -> embedding
 class VocabParallelEmbedding(nn.Module):
 
     def __init__(
@@ -42,6 +42,7 @@ class VocabParallelEmbedding(nn.Module):
         return y
 
 
+# hidden state -> logits
 class ParallelLMHead(VocabParallelEmbedding):
 
     def __init__(
@@ -55,12 +56,20 @@ class ParallelLMHead(VocabParallelEmbedding):
 
     def forward(self, x: torch.Tensor):
         context = get_context()
-        if context.is_prefill:
+
+        if context.is_prefill and not context.is_verify: # not verify
             last_indices = context.cu_seqlens_q[1:] - 1
+
+            # only last one -> x.shape [num_seqs, hidden]
+            # verify m draft_tokens -> 1+m logits (last_token + m draft token）
             x = x[last_indices].contiguous()
+
+        # if verify -> all logits
         logits = F.linear(x, self.weight)
+
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
             dist.gather(logits, all_logits, 0)
             logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
+        
         return logits

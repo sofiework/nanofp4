@@ -123,6 +123,7 @@ class Qwen3DecoderLayer(nn.Module):
         self,
         config: Qwen3Config,
     ) -> None:
+        
         super().__init__()
         self.self_attn = Qwen3Attention(
             hidden_size=config.hidden_size,
@@ -149,10 +150,12 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        
         if residual is None:
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
         hidden_states = self.self_attn(positions, hidden_states)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
@@ -169,17 +172,30 @@ class Qwen3Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
+        # eagle3
+        self.aux_layers: tuple[int, ...] = () # assigned by ModelRunner
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        
         hidden_states = self.embed_tokens(input_ids)
         residual = None
-        for layer in self.layers:
+        aux = []
+
+        for i, layer in enumerate(self.layers):
             hidden_states, residual = layer(positions, hidden_states, residual)
+            if i in self.aux_layers:
+                aux.append(hidden_states + residual)
+
         hidden_states, _ = self.norm(hidden_states, residual)
+
+        # get aux hidden states
+        if self.aux_layers:
+            return hidden_states, aux
         return hidden_states
 
 

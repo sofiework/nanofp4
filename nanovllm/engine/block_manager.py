@@ -28,7 +28,10 @@ class BlockManager:
     def __init__(self, num_blocks: int, block_size: int):
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
+
+        # prefix caching
         self.hash_to_block_id: dict[int, int] = dict()
+
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
 
@@ -55,6 +58,7 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
+    # check prefix cache -> return cached block needed
     def can_allocate(self, seq: Sequence) -> int:
         h = -1
         num_cached_blocks = 0
@@ -68,6 +72,7 @@ class BlockManager:
             num_cached_blocks += 1
             if block_id in self.used_block_ids:
                 num_new_blocks -= 1
+        # no free block / no new needed
         if len(self.free_block_ids) < num_new_blocks:
             return -1
         return num_cached_blocks
@@ -100,17 +105,32 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.block_table.clear()
 
-    def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+    # if current block enought to put k + 1 KV, if not, how much need
+    def _new_blocks(self, seq: Sequence, k: int) -> int:
+        # k is n-gram draft_length
+        b = self.block_size
+        
+        # ceil(total_blocks_need) - current_blocks
+        return ((len(seq) + k + b - 1) // b) - len(seq.block_table)
 
-    def may_append(self, seq: Sequence):
-        if len(seq) % self.block_size == 1:
+    # if enough free block
+    def can_append(self, seq: Sequence, k: int) -> bool:
+        # free >= new need
+        return len(self.free_block_ids) >= self._new_blocks(seq, k)
+
+    # take blocks from free -> append to seq.block_table
+    def may_append(self, seq: Sequence, k: int) -> None:
+        for _ in range(self._new_blocks(seq, k)):
             seq.block_table.append(self._allocate_block())
+            
 
     def hash_blocks(self, seq: Sequence):
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
-        if start == end: return
+        # start block == end block, no new block full
+        if start == end: return 
+
+        # hash block when full
         h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
         for i in range(start, end):
             block = self.blocks[seq.block_table[i]]

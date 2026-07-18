@@ -6,9 +6,9 @@ from nanovllm.sampling_params import SamplingParams
 
 
 class SequenceStatus(Enum):
-    WAITING = auto()
-    RUNNING = auto()
-    FINISHED = auto()
+    WAITING = auto() # not yet prefill / chunked prefilling
+    RUNNING = auto() # prefill done, decoding
+    FINISHED = auto() # all done (EOS / max_tokens)
 
 
 class Sequence:
@@ -16,19 +16,33 @@ class Sequence:
     counter = count()
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
+        # status, id
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
-        self.token_ids = copy(token_ids)
-        self.last_token = token_ids[-1]
-        self.num_tokens = len(self.token_ids)
-        self.num_prompt_tokens = len(token_ids)
-        self.num_cached_tokens = 0
-        self.num_scheduled_tokens = 0
         self.is_prefill = True
-        self.block_table = []
+
+        # token data # prompt -> tokens
+        self.token_ids = copy(token_ids) # list of token id
+        self.last_token = token_ids[-1]
+        self.num_tokens = len(self.token_ids) # += 1 when generate
+        self.num_prompt_tokens = len(token_ids) # initial num_token in prompt
+        # scheduler
+        self.num_cached_tokens = 0 # how many in KV cache
+        self.num_scheduled_tokens = 0
+        
+        # paged attention
+        self.block_table = [] # page table of current seq
+        # sampling parameter
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+
+        # priority scheduling
+        self.priority = sampling_params.priority
+        self.arrival_time = 0.0
+
+        # speculative decoding
+        self.draft_tokens: list[int] = []
 
     def __len__(self):
         return self.num_tokens
