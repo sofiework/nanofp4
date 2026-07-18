@@ -34,6 +34,17 @@ class LLMEngine:
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
 
+        # per-token timing for benchmarks (off by default, set collect_metrics=True before generate)
+        self.collect_metrics = False
+        self.submit_time: dict[int, float] = {}
+        self.token_times: dict[int, list[float]] = {}
+        self._recorded: dict[int, int] = {}
+
+    def reset_metrics(self):
+        self.submit_time.clear()
+        self.token_times.clear()
+        self._recorded.clear()
+
     def exit(self):
         self.model_runner.call("exit")
         del self.model_runner
@@ -45,12 +56,27 @@ class LLMEngine:
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
+        if self.collect_metrics:
+            self.submit_time[seq.seq_id] = perf_counter()
+            self.token_times[seq.seq_id] = []
+            self._recorded[seq.seq_id] = 0
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
+
+        # record a timestamp for each newly produced completion token
+        if self.collect_metrics:
+            now = perf_counter()
+            for seq in seqs:
+                n = seq.num_completion_tokens
+                rec = self._recorded.get(seq.seq_id, 0)
+                if n > rec:
+                    self.token_times[seq.seq_id].extend([now] * (n - rec))
+                    self._recorded[seq.seq_id] = n
+
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 
