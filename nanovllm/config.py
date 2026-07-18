@@ -17,6 +17,11 @@ class Config:
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
 
+    # speculative decoding
+    enable_spec: bool = False
+    num_spec_tokens: int = 0       # k draft tokens per step (0 when disabled)
+    spec_method: str = "ngram"     # "ngram" | "eagle3"
+
     def __post_init__(self):
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0

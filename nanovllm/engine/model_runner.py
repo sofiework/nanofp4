@@ -187,6 +187,40 @@ class ModelRunner:
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
+    # spec verify: feed [last_token, d1..dm] per seq through the paged-KV varlen path
+    def prepare_verify(self, seqs: list[Sequence]):
+        input_ids = []
+        positions = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        max_seqlen_q = 0
+        max_seqlen_k = 0
+        slot_mapping = []
+        for seq in seqs:
+            start = seq.num_cached_tokens          # = len(seq) - 1, position of last_token
+            q_ids = [seq.last_token] + seq.draft_tokens
+            seqlen_q = len(q_ids)
+            end = start + seqlen_q
+            seqlen_k = end
+            input_ids.extend(q_ids)
+            positions.extend(range(start, end))
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+            max_seqlen_q = max(seqlen_q, max_seqlen_q)
+            max_seqlen_k = max(seqlen_k, max_seqlen_k)
+            for pos in range(start, end):
+                block = seq.block_table[pos // self.block_size]
+                slot_mapping.append(block * self.block_size + pos % self.block_size)
+        block_tables = self.prepare_block_tables(seqs)
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                    slot_mapping, None, block_tables, is_verify=True)
+        return input_ids, positions
+
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = [seq.temperature for seq in seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
@@ -218,6 +252,22 @@ class ModelRunner:
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
+
+    # spec verify forward: greedy argmax over [last_token, drafts] for each seq
+    @torch.inference_mode()
+    def run_verify(self, seqs: list[Sequence]) -> list[list[int]]:
+        input_ids, positions = self.prepare_verify(seqs)
+        logits = self.run_model(input_ids, positions, is_prefill=True)   # varlen; is_verify keeps all logits
+        reset_context()
+        if self.rank != 0:
+            return []
+        target_argmax = logits.argmax(dim=-1).tolist()
+        out, idx = [], 0
+        for seq in seqs:
+            n = 1 + len(seq.draft_tokens)
+            out.append(target_argmax[idx:idx + n])
+            idx += n
+        return out
 
     @torch.inference_mode()
     def capture_cudagraph(self):

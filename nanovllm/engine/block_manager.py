@@ -100,11 +100,16 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.block_table.clear()
 
-    def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+    # new blocks needed to hold the seq plus k speculative draft tokens (k=0 -> plain decode)
+    def _new_blocks(self, seq: Sequence, k: int) -> int:
+        b = self.block_size
+        return ((len(seq) + k + b - 1) // b) - len(seq.block_table)
 
-    def may_append(self, seq: Sequence):
-        if len(seq) % self.block_size == 1:
+    def can_append(self, seq: Sequence, k: int = 0) -> bool:
+        return len(self.free_block_ids) >= self._new_blocks(seq, k)
+
+    def may_append(self, seq: Sequence, k: int = 0):
+        for _ in range(self._new_blocks(seq, k)):
             seq.block_table.append(self._allocate_block())
 
     def hash_blocks(self, seq: Sequence):

@@ -16,6 +16,9 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
+        # speculative decoding: reserve room for 1 + k tokens per decode step
+        self.k = config.num_spec_tokens if config.enable_spec else 0
+
     def is_finished(self):
         return not self.waiting and not self.running
 
@@ -57,16 +60,16 @@ class Scheduler:
         # decode
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
+            while not self.block_manager.can_append(seq, self.k):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
                     self.preempt(seq)
                     break
             else:
-                seq.num_scheduled_tokens = 1
+                seq.num_scheduled_tokens = 1 + self.k
                 seq.is_prefill = False
-                self.block_manager.may_append(seq)
+                self.block_manager.may_append(seq, self.k)
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs))
@@ -90,3 +93,39 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
+
+    # speculative decode: greedy accept/reject drafts against the target's argmax, then roll back KV.
+    # decode_verify[i] = target argmax at [last_token, d1..dm] -> 1 + m tokens.
+    def postprocess_spec(self, seqs: list[Sequence], decode_verify: list[list[int]]):
+        for seq, target_argmax in zip(seqs, decode_verify):
+            drafts = seq.draft_tokens
+            # accept the longest matching prefix, plus one bonus token (the first mismatch / next token)
+            committed = []
+            for j in range(len(drafts)):
+                committed.append(target_argmax[j])
+                if target_argmax[j] != drafts[j]:
+                    break
+            else:
+                committed.append(target_argmax[len(drafts)])
+            num_accepted = len(committed) - 1
+
+            finished = False
+            for token_id in committed:
+                seq.append_token(token_id)
+                if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                    finished = True
+                    break
+            seq.draft_tokens = []
+
+            if finished:
+                seq.status = SequenceStatus.FINISHED
+                self.block_manager.deallocate(seq)
+                self.running.remove(seq)
+                continue
+
+            # verify wrote KV for all 1 + m tokens; only 1 + num_accepted are valid.
+            # hash the committed span, then roll back num_cached_tokens to len - 1 (rejected KV is overwritten next step).
+            seq.num_scheduled_tokens = 1 + num_accepted
+            self.block_manager.hash_blocks(seq)
+            seq.num_cached_tokens = len(seq) - 1
+            seq.num_scheduled_tokens = 0

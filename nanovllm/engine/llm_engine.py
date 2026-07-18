@@ -10,6 +10,7 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.utils.spec_decoding.ngram import propose_draft
 
 
 class LLMEngine:
@@ -49,8 +50,15 @@ class LLMEngine:
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        if self.scheduler.k and not is_prefill:
+            # speculative decode: propose drafts, verify them, accept/reject
+            for seq in seqs:
+                seq.draft_tokens = propose_draft(seq.token_ids, self.scheduler.k, n=3)
+            decode_verify = self.model_runner.call("run_verify", seqs)
+            self.scheduler.postprocess_spec(seqs, decode_verify)
+        else:
+            token_ids = self.model_runner.call("run", seqs, is_prefill)
+            self.scheduler.postprocess(seqs, token_ids, is_prefill)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 
