@@ -97,7 +97,7 @@ class ModelRunner:
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
-        self.run(seqs, True)
+        self.run(seqs, [])
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -211,13 +211,23 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    # iteration-level: one forward for decode (cuda graph) + one for prefill (varlen).
+    # token_ids order = decode seqs first, then prefill seqs.
+    def run(self, prefill_seqs: list[Sequence], decode_seqs: list[Sequence]) -> list[int]:
+        token_ids = []
+        if decode_seqs:
+            token_ids += self._run_one(decode_seqs, is_prefill=False)
+        if prefill_seqs:
+            token_ids += self._run_one(prefill_seqs, is_prefill=True)
+        return token_ids
+
+    def _run_one(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
-        return token_ids
+        return token_ids if self.rank == 0 else []
 
     @torch.inference_mode()
     def capture_cudagraph(self):
