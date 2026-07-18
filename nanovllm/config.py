@@ -21,10 +21,14 @@ class Config:
     enable_spec: bool = False
     num_spec_tokens: int = 0       # k draft tokens per step (0 when disabled)
     spec_method: str = "ngram"     # "ngram" | "eagle3"
+    draft_model: str = ""          # eagle3 draft-head weights path
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
+        if self.spec_method == "eagle3":
+            assert self.enable_spec, "eagle3 requires enable_spec=True"
+            assert os.path.isdir(self.draft_model), "eagle3 requires draft_model path"
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

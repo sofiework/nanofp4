@@ -170,6 +170,9 @@ class Qwen3Model(nn.Module):
         self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # eagle3: layer indices whose hidden states feed the draft head (set by ModelRunner)
+        self.aux_layers: tuple[int, ...] = ()
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -177,9 +180,15 @@ class Qwen3Model(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
-        for layer in self.layers:
+        aux = []
+        for i, layer in enumerate(self.layers):
             hidden_states, residual = layer(positions, hidden_states, residual)
+            if i in self.aux_layers:
+                aux.append(hidden_states + residual)
         hidden_states, _ = self.norm(hidden_states, residual)
+        # eagle3: also return the collected aux hidden states
+        if self.aux_layers:
+            return hidden_states, aux
         return hidden_states
 
 
