@@ -42,10 +42,15 @@ PROMPTS = [
 
 # weight_scale_fp8=True: store the NVFP4 per-group scale as fp8_e4m3 (native ckpt dtype) not fp16 ->
 # ~2 GB less weight VRAM (32B weights ~21->19 GB), lossless. Needed to fit eagle3's draft head on 24 GB.
+# gpu_memory_utilization is per-config: no_spec is CUDA-graphed and needs ~2-3 GB of free VRAM after the KV
+# pool for the graph memory pool, so 0.90. eagle3 runs eager (no graph pool) but carries the extra draft
+# head (~1.7 GB) + an extra KV layer, so it needs a HIGHER util (0.95) just to leave room for one KV block.
 CONFIGS = {
-    "no_spec": dict(weight_quant="nvfp4", weight_scale_fp8=True, kv_quant_target="fp4"),
+    "no_spec": dict(weight_quant="nvfp4", weight_scale_fp8=True, kv_quant_target="fp4",
+                    gpu_memory_utilization=0.90),
     "eagle3":  dict(weight_quant="nvfp4", weight_scale_fp8=True, kv_quant_target="fp4", kv_quant_draft="fp4",
-                    enable_spec=True, num_spec_tokens=K, spec_method="eagle3", draft_model=DRAFT),
+                    enable_spec=True, num_spec_tokens=K, spec_method="eagle3", draft_model=DRAFT,
+                    gpu_memory_utilization=0.95),
 }
 
 
@@ -61,8 +66,10 @@ def run(cfg_name):
     # 24 GB is tight: max_num_batched_tokens caps the warmup/prefill activation spike (default 16384 OOMs);
     # fp8 weight scales (in CONFIGS) free ~2 GB so eagle3's head fits. If graph capture OOMs, set
     # enforce_eager=True; if KV won't allocate, raise gpu_memory_utilization or lower max_model_len.
+    print(f"  [{cfg_name}] util={cfg.get('gpu_memory_utilization')} max_num_batched_tokens=512 "
+          f"max_model_len=2048  (confirms you pulled the fit fix)")
     llm = LLM(MODEL, enforce_eager=False, max_model_len=2048, max_num_batched_tokens=512,
-              max_num_seqs=8, gpu_memory_utilization=0.95, **cfg)
+              max_num_seqs=8, **cfg)
     tok = llm.tokenizer
     rows = []
     for pid, text in PROMPTS:
