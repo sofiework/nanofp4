@@ -86,6 +86,16 @@
     非纯 BW bound**。Claude 加 split-K GEMV kernel (M<=64, atomic-add fp32, env NVFP4_SPLIT_K/GEMV_MAX_M 可调,
     SPLIT_K=1 或 GEMV_MAX_M=0 可关) + bench_nvfp4_gemm.py。correctness sm_86 验过 (rel<5e-4, 全栈 coherent);
     实际加速需 user 在 4090 measure + sweep SPLIT_K。可能还需 GEMV-shaped kernel (去掉 tl.dot 浪费) 或 fp8-TC prefill
+  - decode perf 迭代 (4090 measured):
+    (1) split-K GEMV: decode BW 32->120 GB/s, SPLIT_K=8 最优
+    (2) arithmetic E2M1 decode (去 LUT gather): decode ratio 降到 ~1.0x vs fp16 (parity, GEMM 解决);
+        no_spec 1.7->5.4 tok/s。但 ITL 183ms 里只 ~66ms 是 GEMM, ~117ms 是 eager overhead
+    (3) CUDA graph for nvfp4+fp4-KV decode (Claude 代写): 需 (a) 把 fp4 KV store 从 boolean-mask torch
+        改成 fixed-grid triton kernel (skip -1 in-kernel, 无 host sync -> capturable);
+        (b) model_runner enforce_eager 放开 (nvfp4+fp4KV 可 capture; 只 eagle3 tuple + fp8KV 仍 eager);
+        (c) bench enforce_eager=False + max_num_seqs=8。坑: store kernel 假设 head_dim contiguous, 但
+        decode k/v 是 qkv-split view -> 必须 .contiguous()。1.7B 本地验证: graph 19->32.9 tok/s = 1.73x,
+        coherent, 全 correctness test pass。fp8-KV store 仍 boolean-mask torch (不 capturable, fp8 走 eager)
 
 ## priority scheduling design (user-decided)
 - scenario: 交互式 fast vs 批处理 normal, 用户可选 fast/normal mode (tiered)

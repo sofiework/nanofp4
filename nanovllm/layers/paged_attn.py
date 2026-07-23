@@ -141,26 +141,79 @@ def _paged_grid(device):
     return _grid_cache[device]
 
 
+@triton.jit
+def _fp4_encode(xs):
+    # normalized value -> E2M1 code 0..15 (magnitude via nearest-grid thresholds + sign bit). Matches
+    # torch.bucketize on the grid midpoints used by _quant_fp4_kv / fake_quant_kv.
+    a = tl.abs(xs)
+    idx = ((a > 0.25).to(tl.int32) + (a > 0.75).to(tl.int32) + (a > 1.25).to(tl.int32)
+           + (a > 1.75).to(tl.int32) + (a > 2.5).to(tl.int32) + (a > 3.5).to(tl.int32) + (a > 5.0).to(tl.int32))
+    return idx + tl.where(xs < 0, 8, 0).to(tl.int32)
+
+
+@triton.jit
+def _fp4_pack(e, o):
+    # e,o: [NB,8] even/odd elements of each 16-wide block. per-block amax/6 scale, encode, pack 2 codes/byte.
+    amax = tl.max(tl.maximum(tl.abs(e), tl.abs(o)), axis=1)     # [NB]
+    scale = tl.maximum(amax / 6.0, 1e-12)                       # _E2M1_MAX; literal for triton jit
+    ce = _fp4_encode(e / scale[:, None])
+    co = _fp4_encode(o / scale[:, None])
+    return (ce | (co << 4)).to(tl.uint8), scale                # packed [NB,8], scale [NB]
+
+
+@triton.jit
+def _store_kv_fp4_kernel(K, V, KC, VC, KS, VS, SLOT,
+                         s_n, s_h, sc_s, sc_h, ss_s, ss_h, NB: tl.constexpr):
+    # one program per (token, kv_head). -1 slot -> skip (in-kernel branch, no host sync) so the grid is
+    # fixed [n, KVH] and the launch is CUDA-graph-capturable (unlike the boolean-mask torch path).
+    t = tl.program_id(0)
+    h = tl.program_id(1)
+    slot = tl.load(SLOT + t)
+    if slot == -1:
+        return
+    nb = tl.arange(0, NB)[:, None]          # block index within head_dim
+    p = tl.arange(0, 8)[None, :]            # pair index within a 16-block
+    even = nb * 16 + p * 2
+    odd = even + 1
+    off_in = t * s_n + h * s_h
+    pk = nb * 8 + p                          # packed byte position (D//2)
+    ks_idx = tl.arange(0, NB)
+    kp, ks = _fp4_pack(tl.load(K + off_in + even).to(tl.float32), tl.load(K + off_in + odd).to(tl.float32))
+    tl.store(KC + slot * sc_s + h * sc_h + pk, kp)
+    tl.store(KS + slot * ss_s + h * ss_h + ks_idx, ks)
+    vp, vs = _fp4_pack(tl.load(V + off_in + even).to(tl.float32), tl.load(V + off_in + odd).to(tl.float32))
+    tl.store(VC + slot * sc_s + h * sc_h + pk, vp)
+    tl.store(VS + slot * ss_s + h * ss_h + ks_idx, vs)
+
+
 @torch.no_grad()
 def store_kv_quant(k, v, k_cache, v_cache, k_scale, v_scale, slot_mapping, fmt):
-    """Write quantized k,v (+ scales) into the paged cache at slot_mapping (-1 = skip). torch, no kernel."""
+    """Write quantized k,v (+ scales) into the paged cache at slot_mapping (-1 = skip).
+    fp4: a fixed-grid Triton kernel (CUDA-graph-capturable). fp8: torch (kept eager)."""
+    n, KVH, D = k.shape
+    if fmt == "fp4":
+        # the kernel indexes head_dim as contiguous; k/v arrive as qkv-split views (head_dim IS unit-stride,
+        # but make sure) — cheap since k,v are tiny ([n, KVH, D]).
+        k, v = k.contiguous(), v.contiguous()
+        kc, vc = k_cache.view(-1, KVH, D // 2), v_cache.view(-1, KVH, D // 2)
+        ks_, vs_ = k_scale.view(-1, KVH, D // 16), v_scale.view(-1, KVH, D // 16)
+        _store_kv_fp4_kernel[(n, KVH)](
+            k, v, kc, vc, ks_, vs_, slot_mapping,
+            k.stride(0), k.stride(1), kc.stride(0), kc.stride(1), ks_.stride(0), ks_.stride(1),
+            NB=D // 16,
+        )
+        return
+    # fp8: torch path (boolean mask, not graph-capturable -> fp8-KV runs eager).
     valid = slot_mapping != -1
     if not torch.any(valid):
         return
     sl = slot_mapping[valid].long()
     k, v = k[valid], v[valid]
     KVH, D = k.shape[1], k.shape[2]
-    if fmt == "fp8":
-        sk = (k.abs().amax(-1) / _E4M3_MAX).clamp_min(1e-12)
-        sv = (v.abs().amax(-1) / _E4M3_MAX).clamp_min(1e-12)
-        k_cache.view(-1, KVH, D)[sl] = (k / sk.unsqueeze(-1)).to(k_cache.dtype)
-        v_cache.view(-1, KVH, D)[sl] = (v / sv.unsqueeze(-1)).to(v_cache.dtype)
-        k_scale.view(-1, KVH)[sl] = sk
-        v_scale.view(-1, KVH)[sl] = sv
-    else:   # fp4
-        kp, ks = _quant_fp4_kv(k)
-        vp, vs = _quant_fp4_kv(v)
-        k_cache.view(-1, KVH, D // 2)[sl] = kp
-        v_cache.view(-1, KVH, D // 2)[sl] = vp
-        k_scale.view(-1, KVH, D // 16)[sl] = ks
-        v_scale.view(-1, KVH, D // 16)[sl] = vs
+    # fp8 (e4m3): per-(token,head) amax/448 scale
+    sk = (k.abs().amax(-1) / _E4M3_MAX).clamp_min(1e-12)
+    sv = (v.abs().amax(-1) / _E4M3_MAX).clamp_min(1e-12)
+    k_cache.view(-1, KVH, D)[sl] = (k / sk.unsqueeze(-1)).to(k_cache.dtype)
+    v_cache.view(-1, KVH, D)[sl] = (v / sv.unsqueeze(-1)).to(v_cache.dtype)
+    k_scale.view(-1, KVH)[sl] = sk
+    v_scale.view(-1, KVH)[sl] = sv

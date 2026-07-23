@@ -20,10 +20,11 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
-        # eagle3 returns a tuple (aux) from the model -> cuda graph capture can't handle it; run eager.
-        # nvfp4 weights / quantized KV also run eager (triton dequant kernels, first-run path).
+        # CUDA-graph the decode path when possible. Stay eager for: eagle3 (model returns a tuple -> capture
+        # can't handle it), and fp8 KV (its store is a boolean-mask torch path + e4m3 needs sm_89). nvfp4
+        # weights + fp4 KV ARE graph-capturable: the GEMV/paged-attn/fp4-store are all fixed-grid kernels.
         self.enforce_eager = (config.enforce_eager or config.spec_method == "eagle3"
-                              or config.weight_quant == "nvfp4" or config.kv_quant_target)
+                              or config.kv_quant_target == "fp8")
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event

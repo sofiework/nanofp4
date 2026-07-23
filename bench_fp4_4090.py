@@ -55,10 +55,14 @@ def pct(xs, q):
 
 def run(cfg_name):
     cfg = CONFIGS[cfg_name]
-    # 24 GB is tight: max_num_batched_tokens caps the warmup/prefill activation spike (default 16384
-    # OOMs); fp8 weight scales (in CONFIGS) free ~2 GB so eagle3's head fits. Raise gpu_memory_utilization
-    # or lower max_model_len if KV still won't allocate; drop max_num_batched_tokens to 1024 if warmup OOMs.
-    llm = LLM(MODEL, enforce_eager=True, max_model_len=2048, max_num_batched_tokens=2048, **cfg)
+    # enforce_eager=False -> CUDA-graph the decode path (nvfp4 + fp4 KV are capturable; ~1.7x decode on
+    # 1.7B locally). eagle3 is still forced eager internally (tuple return). max_num_seqs=8 keeps graph
+    # capture cheap (only bs<=8 graphs) on tight 24 GB VRAM; this is a bs=1 bench.
+    # 24 GB is tight: max_num_batched_tokens caps the warmup/prefill activation spike (default 16384 OOMs);
+    # fp8 weight scales (in CONFIGS) free ~2 GB so eagle3's head fits. If graph capture OOMs, set
+    # enforce_eager=True; if KV won't allocate, raise gpu_memory_utilization or lower max_model_len.
+    llm = LLM(MODEL, enforce_eager=False, max_model_len=2048, max_num_batched_tokens=2048,
+              max_num_seqs=8, **cfg)
     tok = llm.tokenizer
     rows = []
     for pid, text in PROMPTS:
