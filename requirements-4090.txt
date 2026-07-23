@@ -1,0 +1,12 @@
+# nano-vllm `quant` branch — 4090 (sm_89) / CUDA 13.0 / Python 3.12
+# Pinned to the versions validated locally. Installed by install_4090.sh (flash-attn is handled
+# there, NOT here — its build imports torch, which pip build-isolation would hide).
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+torch==2.9.1+cu130
+triton==3.5.1
+transformers==5.12.1
+safetensors==0.8.0
+xxhash==3.7.0
+numpy==2.5.0
+tqdm==4.68.3
