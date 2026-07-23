@@ -66,8 +66,11 @@ def _nvfp4_gemm_kernel(
         b_nibble = tl.where((offs_k & 1)[:, None] == 1, high, low)
         base = tl.load(LUT_ptr + b_nibble)
         scale_idx = offs_k // GROUP_SIZE
-        scale = tl.load(S_ptr + scale_idx[:, None] * stride_sk + offs_n[None, :] * stride_sn,
-                        mask=mask_k[:, None] & mask_n[None, :], other=0).to(tl.float16)
+        S_u8 = S_ptr.to(tl.pointer_type(tl.uint8))
+        s_raw = tl.load(S_u8 + scale_idx[:, None] * stride_sk + offs_n[None, :] * stride_sn,
+                        mask=mask_k[:, None] & mask_n[None, :], other=0)
+        scale = s_raw.to(tl.float8e4nv, bitcast=True).to(tl.float16)
+
         b = base * scale
         acc += tl.dot(a, b)
         k += BLOCK_K
