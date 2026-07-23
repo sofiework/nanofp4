@@ -151,6 +151,23 @@ fp4 tensor cores), fp4/fp8 KV with a real decode+varlen read kernel. Ported/adap
    Validated: kernel bf16-exact (2e-7) vs flash-attn, fp4 ~5e-4 (decode+varlen); full stack (nvfp4 weights +
    fp4 KV + eagle3) coherent end-to-end; non-quant path byte-exact (no regression).
 
+### VRAM fit on the 4090 (measured 2026-07-23) + fp8-scale fix
+Diagnostic (util 0.9, batched=512): `total=23.52G weights=21.09G peak=21.20G free=1.95G`. Weights alone
+(packed 4-bit ~15.6G + **fp16 per-group scales ~3.9G** + tied embed/lm_head ~1.5G) nearly fill the 90%
+line → `num_kvcache_blocks` computes ≤0 (assert fails); the eagle3 head (~1.3G) does not fit at all.
+- **Root cause of the spike-OOM**: `max_num_batched_tokens` default 16384 → warmup runs a 16384-token
+  prefill. Fix: `max_num_batched_tokens=2048` (bench now sets it) shrinks the warmup activation ~8×.
+- **Weight-memory fix (implemented)**: store the per-group block scale as **fp8_e4m3** (the ckpt's native
+  dtype; we were upcasting to fp16) via `weight_scale_fp8=True`. Frees ~2G (3.9→2.0), lossless, matches the
+  Step-0b fake-quant. Global `scale_2` kept as a per-output-column vector applied in the GEMM (handles
+  merged qkv/gate_up). → weights ~19.1G, eagle3 head fits. AdaLLM confirms this is the native format (it
+  wastefully upcasts to fp16); AdaLLM has **no** dense-32B proof point (its ceiling = Gemma3-27B @ 19.83G).
+- Implemented + validated on sm_86: `config.weight_scale_fp8`, `quant.QuantConfig.scale_fp8`,
+  `linear.py` (fp8 scale param + `weight_scale_2` [out] vector), `nvfp4_gemm.py` (S2_ptr, `acc*=g`),
+  `loader.py` (route native fp8 scale + expand scalar scale_2 per shard). GEMM scale_2 path matches
+  reference (rel<5e-4); fp16 default path byte-exact (no regression); fp8 storage/loader ops OK; full
+  eagle3 stack coherent. **4090-only residual**: the Triton fp8 e4m3 *load* in the GEMM (sm_89).
+
 ### Residual — 4090-only (cannot be done/validated on sm_86)
 - **Download** `AngelSlim/Qwen3-32B_nvfp4` (packed weights) + `AngelSlim/Qwen3-32B_eagle3` (head); point
   `bench_fp4_4090.py:MODEL` at the nvfp4 dir (already set).

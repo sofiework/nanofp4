@@ -43,9 +43,10 @@ class ModelRunner:
                 group_size = int(qc["config_groups"]["group_0"]["weights"]["group_size"])
             except Exception:
                 group_size = 16
-            set_weight_quant(True, group_size)
+            set_weight_quant(True, group_size, config.weight_scale_fp8)
         self.model = Qwen3ForCausalLM(hf_config)
         self.model.nvfp4_group_size = group_size
+        self.model.nvfp4_scale_fp8 = nvfp4 and config.weight_scale_fp8
         set_weight_quant(False)
         load_model(self.model, config.model)
         self.sampler = Sampler()

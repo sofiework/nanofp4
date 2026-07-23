@@ -39,9 +39,11 @@ PROMPTS = [
     ("story", "Write a short story about a lighthouse keeper who discovers a message in a bottle."),
 ]
 
+# weight_scale_fp8=True: store the NVFP4 per-group scale as fp8_e4m3 (native ckpt dtype) not fp16 ->
+# ~2 GB less weight VRAM (32B weights ~21->19 GB), lossless. Needed to fit eagle3's draft head on 24 GB.
 CONFIGS = {
-    "no_spec": dict(weight_quant="nvfp4", kv_quant_target="fp4"),
-    "eagle3":  dict(weight_quant="nvfp4", kv_quant_target="fp4", kv_quant_draft="fp4",
+    "no_spec": dict(weight_quant="nvfp4", weight_scale_fp8=True, kv_quant_target="fp4"),
+    "eagle3":  dict(weight_quant="nvfp4", weight_scale_fp8=True, kv_quant_target="fp4", kv_quant_draft="fp4",
                     enable_spec=True, num_spec_tokens=K, spec_method="eagle3", draft_model=DRAFT),
 }
 
@@ -52,7 +54,10 @@ def pct(xs, q):
 
 def run(cfg_name):
     cfg = CONFIGS[cfg_name]
-    llm = LLM(MODEL, enforce_eager=True, enable_mixbatch=False, max_model_len=4096, **cfg)
+    # 24 GB is tight: max_num_batched_tokens caps the warmup/prefill activation spike (default 16384
+    # OOMs); fp8 weight scales (in CONFIGS) free ~2 GB so eagle3's head fits. Raise gpu_memory_utilization
+    # or lower max_model_len if KV still won't allocate; drop max_num_batched_tokens to 1024 if warmup OOMs.
+    llm = LLM(MODEL, enforce_eager=True, max_model_len=2048, max_num_batched_tokens=2048, **cfg)
     tok = llm.tokenizer
     rows = []
     for pid, text in PROMPTS:

@@ -67,8 +67,16 @@
     - 验证: GEMM vs dequant-matmul 3e-4; paged kernel bf16 exact 2e-7 / fp4 5e-4; 1.7B 全栈
       (nvfp4+fp4KV+eagle3) coherent; non-quant byte-exact 无 regression
   - 4090-only 残留 (sm_86 做不了): 下载 packed nvfp4 ckpt / fp8-read kernel 只 sm_89 编译得过 /
-    perf tuning / VRAM fit (~18G 权重+embed+head 紧) / output-quality eval。详见 fp4_spec_4090_plan.md
-    "Residual". bench_fp4_4090.py 已指向 nvfp4 ckpt, 拷到 4090 即可跑
+    perf tuning / output-quality eval。详见 fp4_spec_4090_plan.md "Residual". bench_fp4_4090.py 已指向
+    nvfp4 ckpt, 拷到 4090 即可跑
+  - VRAM fit (2026-07-23, 4090 实测): 32B weights 21.09G (packed 15.6 + fp16 scale 3.9 + tied embed 1.5)
+    几乎占满 24G 90% 线 -> num_kvcache_blocks≤0 assert 挂; eagle3 head 装不下。两处修复 (Claude 代写,
+    sm_86 验过, byte-exact 无 regression):
+    (1) max_num_batched_tokens 默认 16384 -> warmup 16384-token prefill OOM; bench 改 2048
+    (2) fp8_e4m3 weight scale (weight_scale_fp8=True): per-group scale fp16->fp8 (ckpt 原生 dtype, 无损),
+        省 ~2G, global scale_2 拆成 per-output 向量在 GEMM 里乘 (处理 merged qkv/gate_up)。weights->19.1G,
+        eagle3 装得下。AdaLLM 证实这是原生格式 (它反而 upcast 到 fp16 浪费), 且 AdaLLM 无 dense-32B 例证
+        (天花板 Gemma3-27B@19.83G)。4090-only 残留: Triton fp8 e4m3 GEMM load (sm_89)
 
 ## priority scheduling design (user-decided)
 - scenario: 交互式 fast vs 批处理 normal, 用户可选 fast/normal mode (tiered)

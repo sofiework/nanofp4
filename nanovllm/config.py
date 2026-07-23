@@ -29,6 +29,10 @@ class Config:
 
     # weight quantization (fake-quant measurement: "" | "nvfp4"); target linears only, head stays bf16
     weight_quant: str = ""
+    # store the NVFP4 per-group block scale as fp8_e4m3 (native ckpt dtype) instead of fp16 — halves
+    # scale VRAM (~2 GB on a 32B), lossless. fp8 scale LOAD in the GEMM needs sm_89 (4090); keep False
+    # on sm_86 (3060 Ti) where the fp16 path stays byte-exact for regression tests.
+    weight_scale_fp8: bool = False
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

@@ -39,16 +39,32 @@ def _is_nvfp4_param(model: nn.Module, packed_modules_mapping: dict, weight_name:
 def load_model(model: nn.Module, path: str):
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     group_size = getattr(model, "nvfp4_group_size", 16)
+    scale_fp8 = getattr(model, "nvfp4_scale_fp8", False)
     for file in glob(os.path.join(path, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:
             keys = set(f.keys())
             for weight_name in keys:
-                if weight_name.endswith((".input_scale", ".weight_scale_2", ".k_scale", ".v_scale")):
-                    continue    # activation/global/kv scales: folded below or unused (weight-only)
+                if weight_name.endswith((".input_scale", ".k_scale", ".v_scale")):
+                    continue    # activation/kv scales: unused (weight-only)
+                if weight_name.endswith(".weight_scale_2"):
+                    if not scale_fp8:
+                        continue    # fp16 path: folded into weight_scale below
+                    # fp8 path: keep scale_2 separate as a per-output [out] global-scale vector; expand a
+                    # per-tensor scalar to the shard's output width so the shard-aware loader fills the
+                    # right merged qkv/gate_up sub-range.
+                    s2 = f.get_tensor(weight_name).cuda().float().reshape(-1)
+                    out = f.get_slice(weight_name[:-len("_scale_2")]).get_shape()[0]
+                    vec = s2.expand(out).contiguous() if s2.numel() == 1 else s2
+                    _route(model, packed_modules_mapping, weight_name, vec)
+                    continue
                 if weight_name.endswith(".weight_scale"):
-                    # NVFP4 per-group block scale (fp8_e4m3). Fold the global scale_2 in and store fp16
-                    # so merged qkv_proj/gate_up_proj (each shard has its own global scale) stay correct.
-                    # Cast on GPU: fp8->float is unsupported on CPU.
+                    # NVFP4 per-group block scale (fp8_e4m3 on disk).
+                    if scale_fp8:
+                        # store natively as fp8 (lossless, half the VRAM); scale_2 handled above.
+                        _route(model, packed_modules_mapping, weight_name, f.get_tensor(weight_name).cuda())
+                        continue
+                    # fp16 path: fold the global scale_2 in and store fp16 so merged qkv_proj/gate_up_proj
+                    # (each shard has its own global scale) stay correct. Cast on GPU: fp8->float unsupported on CPU.
                     scale = f.get_tensor(weight_name).cuda().float()
                     s2_name = weight_name[:-len("_scale")] + "_scale_2"
                     if s2_name in keys:

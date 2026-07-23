@@ -26,15 +26,23 @@ class LinearBase(nn.Module):
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
         qcfg = get_quant_config()
-        # NVFP4 kernel mode: hold packed 4-bit weight + per-group fp16 scale (global scale folded in
-        # at load). Only the target model is built with quant enabled; the eagle3 head stays bf16.
+        # NVFP4 kernel mode: hold packed 4-bit weight + per-group block scale. Only the target model is
+        # built with quant enabled; the eagle3 head stays bf16.
+        #   fp16 scale : global scale_2 folded in at load (weight_scale_2 stays 1) — byte-exact legacy path.
+        #   fp8  scale : native ckpt dtype (half the VRAM); scale_2 kept as a per-output-column vector and
+        #                applied in the GEMM (handles merged qkv/gate_up whose shards have distinct scale_2).
         self.nvfp4 = qcfg.enabled
         self.group_size = qcfg.group_size
         if self.nvfp4:
             assert input_size % 2 == 0 and input_size % self.group_size == 0
+            scale_dtype = torch.float8_e4m3fn if qcfg.scale_fp8 else torch.float16
             self.weight = nn.Parameter(torch.empty(output_size, input_size // 2, dtype=torch.uint8), requires_grad=False)
-            self.weight_scale = nn.Parameter(torch.empty(output_size, input_size // self.group_size, dtype=torch.float16), requires_grad=False)
+            self.weight_scale = nn.Parameter(torch.empty(output_size, input_size // self.group_size, dtype=scale_dtype), requires_grad=False)
             self.weight_scale.weight_loader = self.weight_loader
+            # per-output global scale (1.0 = no-op for the fp16-folded path); shard-aware loader fills
+            # each merged qkv/gate_up sub-range with its own scale_2.
+            self.weight_scale_2 = nn.Parameter(torch.ones(output_size, dtype=torch.float32), requires_grad=False)
+            self.weight_scale_2.weight_loader = self.weight_loader
         else:
             self.weight = nn.Parameter(torch.empty(output_size, input_size))
         self.weight.weight_loader = self.weight_loader
@@ -49,7 +57,7 @@ class LinearBase(nn.Module):
 
     def _apply(self, x: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
         if self.nvfp4:
-            return nvfp4_linear(x, self.weight, self.weight_scale, bias, self.group_size)
+            return nvfp4_linear(x, self.weight, self.weight_scale, self.weight_scale_2, bias, self.group_size)
         return F.linear(x, self.weight, bias)
 
 
