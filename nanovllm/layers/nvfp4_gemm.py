@@ -50,8 +50,20 @@ def _load_scale(S_ptr, off, mask, SCALE_FP8: tl.constexpr):
 
 
 @triton.jit
+def _e2m1_decode(nib):
+    # E2M1 4-bit code -> fp16 value, arithmetically (no LUT gather -> pure ALU, big win once the kernel is
+    # dequant-bound). bit3=sign, bits[2:1]=exp, bit0=mantissa; magnitudes {0,.5,1,1.5,2,3,4,6}.
+    sign = tl.where(nib >= 8, -1.0, 1.0).to(tl.float16)
+    e = (nib >> 1) & 3
+    m = (nib & 1).to(tl.float16)
+    powv = (1 << e).to(tl.float16) * 0.5                       # 2^(e-1): e=0->.5,1->1,2->2,3->4
+    mag = tl.where(e == 0, 0.5 * m, powv * (1.0 + 0.5 * m))     # e==0 is the subnormal (0 or .5)
+    return sign * mag
+
+
+@triton.jit
 def _nvfp4_gemm_kernel(
-    A_ptr, B_ptr, S_ptr, S2_ptr, LUT_ptr, C_ptr, M, N, K,
+    A_ptr, B_ptr, S_ptr, S2_ptr, C_ptr, M, N, K,
     stride_am, stride_ak, stride_bn, stride_bk, stride_sn, stride_sk, stride_cm, stride_cn,
     GROUP_SIZE: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     SCALE_FP8: tl.constexpr,
@@ -77,7 +89,7 @@ def _nvfp4_gemm_kernel(
         low = b_packed & 0x0F
         high = b_packed >> 4
         b_nibble = tl.where((offs_k & 1)[:, None] == 1, high, low)
-        base = tl.load(LUT_ptr + b_nibble)
+        base = _e2m1_decode(b_nibble)
         scale_idx = offs_k // GROUP_SIZE
         scale = _load_scale(S_ptr, scale_idx[:, None] * stride_sk + offs_n[None, :] * stride_sn,
                             mask_k[:, None] & mask_n[None, :], SCALE_FP8)
@@ -95,7 +107,7 @@ def _nvfp4_gemm_kernel(
 
 @triton.jit
 def _nvfp4_gemv_kernel(
-    A_ptr, B_ptr, S_ptr, S2_ptr, LUT_ptr, C_ptr, M, N, K,
+    A_ptr, B_ptr, S_ptr, S2_ptr, C_ptr, M, N, K,
     stride_am, stride_ak, stride_bn, stride_bk, stride_sn, stride_sk, stride_cm, stride_cn,
     GROUP_SIZE: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     SPLIT_K: tl.constexpr, SCALE_FP8: tl.constexpr,
@@ -130,7 +142,7 @@ def _nvfp4_gemv_kernel(
         low = b_packed & 0x0F
         high = b_packed >> 4
         b_nibble = tl.where((offs_k & 1)[:, None] == 1, high, low)
-        base = tl.load(LUT_ptr + b_nibble)
+        base = _e2m1_decode(b_nibble)
         scale_idx = offs_k // GROUP_SIZE
         scale = _load_scale(S_ptr, scale_idx[:, None] * stride_sk + offs_n[None, :] * stride_sn,
                             mask_k[:, None] & mask_n[None, :], SCALE_FP8)
@@ -171,7 +183,6 @@ def nvfp4_linear(x: torch.Tensor, w_packed: torch.Tensor, w_scale: torch.Tensor,
     M, K = x2d.shape
     N = w_packed.shape[0]
     assert w_packed.shape[1] * 2 == K, f"packed {w_packed.shape} vs K={K}"
-    lut = _lut_on(x.device)
     scale_fp8 = w_scale.dtype == torch.float8_e4m3fn
     # Triton can't reinterpret a passed-in pointer's element type, so view the fp8 scale as uint8 here and
     # bitcast in-kernel. (fp8 is 1 byte -> same shape/strides.) fp16 scale is passed through unchanged.
@@ -182,7 +193,7 @@ def nvfp4_linear(x: torch.Tensor, w_packed: torch.Tensor, w_scale: torch.Tensor,
         bm = _GEMV_BLOCK_M
         grid = (triton.cdiv(M, bm) * triton.cdiv(N, _GEMV_BLOCK_N) * _GEMV_SPLIT_K,)
         _nvfp4_gemv_kernel[grid](
-            x2d, w_packed, s_arg, w_scale_2, lut, c32, M, N, K,
+            x2d, w_packed, s_arg, w_scale_2, c32, M, N, K,
             x2d.stride(0), x2d.stride(1), w_packed.stride(0), w_packed.stride(1),
             s_arg.stride(0), s_arg.stride(1), c32.stride(0), c32.stride(1),
             GROUP_SIZE=group_size, BLOCK_M=bm, BLOCK_N=_GEMV_BLOCK_N, BLOCK_K=_GEMV_BLOCK_K,
@@ -194,7 +205,7 @@ def nvfp4_linear(x: torch.Tensor, w_packed: torch.Tensor, w_scale: torch.Tensor,
         cfg = _select_config(M, K)
         grid = (triton.cdiv(M, cfg["BLOCK_M"]) * triton.cdiv(N, cfg["BLOCK_N"]),)
         _nvfp4_gemm_kernel[grid](
-            x2d, w_packed, s_arg, w_scale_2, lut, c, M, N, K,
+            x2d, w_packed, s_arg, w_scale_2, c, M, N, K,
             x2d.stride(0), x2d.stride(1), w_packed.stride(0), w_packed.stride(1),
             s_arg.stride(0), s_arg.stride(1), c.stride(0), c.stride(1),
             GROUP_SIZE=group_size, BLOCK_M=cfg["BLOCK_M"], BLOCK_N=cfg["BLOCK_N"], BLOCK_K=cfg["BLOCK_K"],
