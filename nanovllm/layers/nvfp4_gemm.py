@@ -40,12 +40,13 @@ def _lut_on(device) -> torch.Tensor:
 
 @triton.jit
 def _load_scale(S_ptr, off, mask, SCALE_FP8: tl.constexpr):
-    # fp8_e4m3 scale can't be loaded directly by Triton -> view the storage as uint8 and bitcast to
-    # float8e4nv (needs sm_89). fp16 scale loads directly (any arch; used for local sm_86 validation).
+    # fp8_e4m3 scale: the host passes S_ptr already viewed as uint8 (Triton can't reinterpret a passed-in
+    # pointer's element type), so load the bytes and bitcast them to float8e4nv (needs sm_89). fp16 scale
+    # loads directly (any arch; used for local sm_86 validation).
+    s = tl.load(S_ptr + off, mask=mask, other=0)
     if SCALE_FP8:
-        s_raw = tl.load(S_ptr.to(tl.pointer_type(tl.uint8)) + off, mask=mask, other=0)
-        return s_raw.to(tl.float8e4nv, bitcast=True).to(tl.float16)
-    return tl.load(S_ptr + off, mask=mask, other=0).to(tl.float16)
+        return s.to(tl.float8e4nv, bitcast=True).to(tl.float16)
+    return s.to(tl.float16)
 
 
 @triton.jit
@@ -172,15 +173,18 @@ def nvfp4_linear(x: torch.Tensor, w_packed: torch.Tensor, w_scale: torch.Tensor,
     assert w_packed.shape[1] * 2 == K, f"packed {w_packed.shape} vs K={K}"
     lut = _lut_on(x.device)
     scale_fp8 = w_scale.dtype == torch.float8_e4m3fn
+    # Triton can't reinterpret a passed-in pointer's element type, so view the fp8 scale as uint8 here and
+    # bitcast in-kernel. (fp8 is 1 byte -> same shape/strides.) fp16 scale is passed through unchanged.
+    s_arg = w_scale.view(torch.uint8) if scale_fp8 else w_scale
     if M <= _GEMV_MAX_M:
         # split-K path: fp32 accumulator (atomic-add of SPLIT_K partials), zero-initialized.
         c32 = torch.zeros((M, N), device=x.device, dtype=torch.float32)
         bm = _GEMV_BLOCK_M
         grid = (triton.cdiv(M, bm) * triton.cdiv(N, _GEMV_BLOCK_N) * _GEMV_SPLIT_K,)
         _nvfp4_gemv_kernel[grid](
-            x2d, w_packed, w_scale, w_scale_2, lut, c32, M, N, K,
+            x2d, w_packed, s_arg, w_scale_2, lut, c32, M, N, K,
             x2d.stride(0), x2d.stride(1), w_packed.stride(0), w_packed.stride(1),
-            w_scale.stride(0), w_scale.stride(1), c32.stride(0), c32.stride(1),
+            s_arg.stride(0), s_arg.stride(1), c32.stride(0), c32.stride(1),
             GROUP_SIZE=group_size, BLOCK_M=bm, BLOCK_N=_GEMV_BLOCK_N, BLOCK_K=_GEMV_BLOCK_K,
             SPLIT_K=_GEMV_SPLIT_K, SCALE_FP8=scale_fp8, num_warps=4, num_stages=3,
         )
@@ -190,9 +194,9 @@ def nvfp4_linear(x: torch.Tensor, w_packed: torch.Tensor, w_scale: torch.Tensor,
         cfg = _select_config(M, K)
         grid = (triton.cdiv(M, cfg["BLOCK_M"]) * triton.cdiv(N, cfg["BLOCK_N"]),)
         _nvfp4_gemm_kernel[grid](
-            x2d, w_packed, w_scale, w_scale_2, lut, c, M, N, K,
+            x2d, w_packed, s_arg, w_scale_2, lut, c, M, N, K,
             x2d.stride(0), x2d.stride(1), w_packed.stride(0), w_packed.stride(1),
-            w_scale.stride(0), w_scale.stride(1), c.stride(0), c.stride(1),
+            s_arg.stride(0), s_arg.stride(1), c.stride(0), c.stride(1),
             GROUP_SIZE=group_size, BLOCK_M=cfg["BLOCK_M"], BLOCK_N=cfg["BLOCK_N"], BLOCK_K=cfg["BLOCK_K"],
             SCALE_FP8=scale_fp8, num_warps=cfg["num_warps"], num_stages=cfg["num_stages"],
         )
