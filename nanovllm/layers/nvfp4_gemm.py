@@ -10,6 +10,7 @@ Layout (matches modelopt / compressed-tensors NVFP4, e.g. AngelSlim/Qwen3-32B_nv
     weight_scale  : fp16   [out, in//group]    per-group scale (fp8 block-scale * global, folded)
 E2M1 code bits: bit3=sign, bits[2:1]=exp, bit0=mantissa -> magnitudes {0,.5,1,1.5,2,3,4,6}.
 """
+import os
 import torch
 import triton
 import triton.language as tl
@@ -38,10 +39,21 @@ def _lut_on(device) -> torch.Tensor:
 
 
 @triton.jit
+def _load_scale(S_ptr, off, mask, SCALE_FP8: tl.constexpr):
+    # fp8_e4m3 scale can't be loaded directly by Triton -> view the storage as uint8 and bitcast to
+    # float8e4nv (needs sm_89). fp16 scale loads directly (any arch; used for local sm_86 validation).
+    if SCALE_FP8:
+        s_raw = tl.load(S_ptr.to(tl.pointer_type(tl.uint8)) + off, mask=mask, other=0)
+        return s_raw.to(tl.float8e4nv, bitcast=True).to(tl.float16)
+    return tl.load(S_ptr + off, mask=mask, other=0).to(tl.float16)
+
+
+@triton.jit
 def _nvfp4_gemm_kernel(
     A_ptr, B_ptr, S_ptr, S2_ptr, LUT_ptr, C_ptr, M, N, K,
     stride_am, stride_ak, stride_bn, stride_bk, stride_sn, stride_sk, stride_cm, stride_cn,
     GROUP_SIZE: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    SCALE_FP8: tl.constexpr,
 ):
     pid = tl.program_id(0)
     grid_n = tl.cdiv(N, BLOCK_N)
@@ -66,11 +78,8 @@ def _nvfp4_gemm_kernel(
         b_nibble = tl.where((offs_k & 1)[:, None] == 1, high, low)
         base = tl.load(LUT_ptr + b_nibble)
         scale_idx = offs_k // GROUP_SIZE
-        S_u8 = S_ptr.to(tl.pointer_type(tl.uint8))
-        s_raw = tl.load(S_u8 + scale_idx[:, None] * stride_sk + offs_n[None, :] * stride_sn,
-                        mask=mask_k[:, None] & mask_n[None, :], other=0)
-        scale = s_raw.to(tl.float8e4nv, bitcast=True).to(tl.float16)
-
+        scale = _load_scale(S_ptr, scale_idx[:, None] * stride_sk + offs_n[None, :] * stride_sn,
+                            mask_k[:, None] & mask_n[None, :], SCALE_FP8)
         b = base * scale
         acc += tl.dot(a, b)
         k += BLOCK_K
@@ -83,12 +92,72 @@ def _nvfp4_gemm_kernel(
              acc.to(tl.float16), mask=mask_m[:, None] & mask_n[None, :])
 
 
+@triton.jit
+def _nvfp4_gemv_kernel(
+    A_ptr, B_ptr, S_ptr, S2_ptr, LUT_ptr, C_ptr, M, N, K,
+    stride_am, stride_ak, stride_bn, stride_bk, stride_sn, stride_sk, stride_cm, stride_cn,
+    GROUP_SIZE: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr, SCALE_FP8: tl.constexpr,
+):
+    # Decode / short-prompt path (small M). The plain kernel's grid is only N/BLOCK_N programs -> most SMs
+    # idle -> the weight read runs at a few % of bandwidth. Split the K loop into SPLIT_K independent
+    # programs (grid x SPLIT_K) so the weight read saturates memory bandwidth, atomic-adding partials into
+    # an fp32 C. Each program owns a distinct, BLOCK_K-aligned slice of K (no overlap/gap).
+    pid = tl.program_id(0)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    pid_k = pid % SPLIT_K
+    pid_mn = pid // SPLIT_K
+    pid_m = pid_mn // num_pid_n
+    pid_n = pid_mn % num_pid_n
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    kb_per = tl.cdiv(tl.cdiv(K, BLOCK_K), SPLIT_K)      # K-blocks per split (BLOCK_K-aligned)
+    k0 = pid_k * kb_per * BLOCK_K
+    k1 = tl.minimum(k0 + kb_per * BLOCK_K, K)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    k = k0
+    while k < k1:
+        offs_k = k + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+        a = tl.load(A_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak,
+                    mask=mask_m[:, None] & mask_k[None, :], other=0).to(tl.float16)
+        packed_idx = offs_k >> 1
+        b_packed = tl.load(B_ptr + packed_idx[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+                           mask=mask_k[:, None] & mask_n[None, :], other=0)
+        low = b_packed & 0x0F
+        high = b_packed >> 4
+        b_nibble = tl.where((offs_k & 1)[:, None] == 1, high, low)
+        base = tl.load(LUT_ptr + b_nibble)
+        scale_idx = offs_k // GROUP_SIZE
+        scale = _load_scale(S_ptr, scale_idx[:, None] * stride_sk + offs_n[None, :] * stride_sn,
+                            mask_k[:, None] & mask_n[None, :], SCALE_FP8)
+        acc += tl.dot(a, base * scale)
+        k += BLOCK_K
+    # scale_2 factors out of the K-sum, so applying it per-partial then atomic-adding is exact.
+    g = tl.load(S2_ptr + offs_n, mask=mask_n, other=1.).to(tl.float32)
+    acc = acc * g[None, :]
+    tl.atomic_add(C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+                  acc, mask=mask_m[:, None] & mask_n[None, :])
+
+
 def _select_config(m, k):
     if m <= 16:
         return dict(BLOCK_M=16, BLOCK_N=64, BLOCK_K=64, num_warps=4, num_stages=3)
     if m <= 64:
         return dict(BLOCK_M=64, BLOCK_N=128, BLOCK_K=64, num_warps=4, num_stages=4)
     return dict(BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, num_warps=8, num_stages=4)
+
+
+# Small-M (decode / short-prompt) split-K params. SPLIT_K trades occupancy for atomic-add traffic; 8 is a
+# safe default on Ada, tune on the 4090 via NVFP4_SPLIT_K. Only M <= _GEMV_MAX_M takes this path
+# (grid = N/BLOCK_N is too few programs there); larger M already fills the GPU via the M dimension.
+_GEMV_MAX_M = int(os.getenv("NVFP4_GEMV_MAX_M", "64"))
+_GEMV_SPLIT_K = int(os.getenv("NVFP4_SPLIT_K", "8"))
+_GEMV_BLOCK_M = 16
+_GEMV_BLOCK_N = 64
+_GEMV_BLOCK_K = 64
 
 
 def nvfp4_linear(x: torch.Tensor, w_packed: torch.Tensor, w_scale: torch.Tensor,
@@ -101,16 +170,32 @@ def nvfp4_linear(x: torch.Tensor, w_packed: torch.Tensor, w_scale: torch.Tensor,
     M, K = x2d.shape
     N = w_packed.shape[0]
     assert w_packed.shape[1] * 2 == K, f"packed {w_packed.shape} vs K={K}"
-    c = torch.empty((M, N), device=x.device, dtype=torch.float16)
-    cfg = _select_config(M, K)
-    grid = (triton.cdiv(M, cfg["BLOCK_M"]) * triton.cdiv(N, cfg["BLOCK_N"]),)
-    _nvfp4_gemm_kernel[grid](
-        x2d, w_packed, w_scale, w_scale_2, _lut_on(x.device), c, M, N, K,
-        x2d.stride(0), x2d.stride(1), w_packed.stride(0), w_packed.stride(1),
-        w_scale.stride(0), w_scale.stride(1), c.stride(0), c.stride(1),
-        GROUP_SIZE=group_size, BLOCK_M=cfg["BLOCK_M"], BLOCK_N=cfg["BLOCK_N"], BLOCK_K=cfg["BLOCK_K"],
-        num_warps=cfg["num_warps"], num_stages=cfg["num_stages"],
-    )
+    lut = _lut_on(x.device)
+    scale_fp8 = w_scale.dtype == torch.float8_e4m3fn
+    if M <= _GEMV_MAX_M:
+        # split-K path: fp32 accumulator (atomic-add of SPLIT_K partials), zero-initialized.
+        c32 = torch.zeros((M, N), device=x.device, dtype=torch.float32)
+        bm = _GEMV_BLOCK_M
+        grid = (triton.cdiv(M, bm) * triton.cdiv(N, _GEMV_BLOCK_N) * _GEMV_SPLIT_K,)
+        _nvfp4_gemv_kernel[grid](
+            x2d, w_packed, w_scale, w_scale_2, lut, c32, M, N, K,
+            x2d.stride(0), x2d.stride(1), w_packed.stride(0), w_packed.stride(1),
+            w_scale.stride(0), w_scale.stride(1), c32.stride(0), c32.stride(1),
+            GROUP_SIZE=group_size, BLOCK_M=bm, BLOCK_N=_GEMV_BLOCK_N, BLOCK_K=_GEMV_BLOCK_K,
+            SPLIT_K=_GEMV_SPLIT_K, SCALE_FP8=scale_fp8, num_warps=4, num_stages=3,
+        )
+        c = c32.to(torch.float16)
+    else:
+        c = torch.empty((M, N), device=x.device, dtype=torch.float16)
+        cfg = _select_config(M, K)
+        grid = (triton.cdiv(M, cfg["BLOCK_M"]) * triton.cdiv(N, cfg["BLOCK_N"]),)
+        _nvfp4_gemm_kernel[grid](
+            x2d, w_packed, w_scale, w_scale_2, lut, c, M, N, K,
+            x2d.stride(0), x2d.stride(1), w_packed.stride(0), w_packed.stride(1),
+            w_scale.stride(0), w_scale.stride(1), c.stride(0), c.stride(1),
+            GROUP_SIZE=group_size, BLOCK_M=cfg["BLOCK_M"], BLOCK_N=cfg["BLOCK_N"], BLOCK_K=cfg["BLOCK_K"],
+            SCALE_FP8=scale_fp8, num_warps=cfg["num_warps"], num_stages=cfg["num_stages"],
+        )
     if bias is not None:
         c = c + bias.to(c.dtype)
     return c.to(out_dtype).view(*x.shape[:-1], N)

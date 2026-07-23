@@ -77,6 +77,15 @@
         省 ~2G, global scale_2 拆成 per-output 向量在 GEMM 里乘 (处理 merged qkv/gate_up)。weights->19.1G,
         eagle3 装得下。AdaLLM 证实这是原生格式 (它反而 upcast 到 fp16 浪费), 且 AdaLLM 无 dense-32B 例证
         (天花板 Gemma3-27B@19.83G)。4090-only 残留: Triton fp8 e4m3 GEMM load (sm_89)
+  - fp8 GEMM scale load (4090, user 写 7cd8bf9): Triton 不能直接 .to(fp16) 加载 fp8_e4m3 tensor ->
+    需 S_ptr.to(pointer_type(uint8)) + s.to(float8e4nv, bitcast=True).to(fp16) (sm_89 only)。Claude 后续
+    抽成 _load_scale(SCALE_FP8 constexpr): fp8 走 bitcast, fp16 直接 load (恢复 sm_86 本地验证 + weight_scale_fp8=False)
+  - 32B 首跑 (4090): fp8 stack 跑通但 **very slow** no_spec 1.7 tok/s / itl 589ms / ttft ~990ms。诊断:
+    decode 是 dequant GEMV, M=1 时 plain kernel grid 只 N/BLOCK_N 个 program (SM 大量闲置) + LUT gather +
+    tl.dot 在 M=1 浪费。3060Ti microbench 显示 nvfp4 读的数据比 fp16 少 4x 却慢 7x -> **compute/latency bound
+    非纯 BW bound**。Claude 加 split-K GEMV kernel (M<=64, atomic-add fp32, env NVFP4_SPLIT_K/GEMV_MAX_M 可调,
+    SPLIT_K=1 或 GEMV_MAX_M=0 可关) + bench_nvfp4_gemm.py。correctness sm_86 验过 (rel<5e-4, 全栈 coherent);
+    实际加速需 user 在 4090 measure + sweep SPLIT_K。可能还需 GEMV-shaped kernel (去掉 tl.dot 浪费) 或 fp8-TC prefill
 
 ## priority scheduling design (user-decided)
 - scenario: 交互式 fast vs 批处理 normal, 用户可选 fast/normal mode (tiered)
