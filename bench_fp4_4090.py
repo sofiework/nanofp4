@@ -66,9 +66,9 @@ def run(cfg_name):
     # 24 GB is tight: max_num_batched_tokens caps the warmup/prefill activation spike (default 16384 OOMs);
     # fp8 weight scales (in CONFIGS) free ~2 GB so eagle3's head fits. If graph capture OOMs, set
     # enforce_eager=True; if KV won't allocate, raise gpu_memory_utilization or lower max_model_len.
-    print(f"  [{cfg_name}] util={cfg.get('gpu_memory_utilization')} max_num_batched_tokens=512 "
+    print(f"  [{cfg_name}] util={cfg.get('gpu_memory_utilization')} max_num_batched_tokens=256 "
           f"max_model_len=2048  (confirms you pulled the fit fix)")
-    llm = LLM(MODEL, enforce_eager=False, max_model_len=2048, max_num_batched_tokens=512,
+    llm = LLM(MODEL, enforce_eager=False, max_model_len=2048, max_num_batched_tokens=256,
               max_num_seqs=8, **cfg)
     tok = llm.tokenizer
     rows = []

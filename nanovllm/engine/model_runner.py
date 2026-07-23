@@ -154,8 +154,16 @@ class ModelRunner:
             cache_dtype, cache_hd, scale_hd = hf_config.dtype, head_dim, 0
         per_head = cache_hd * cache_dtype.itemsize + scale_hd * 4   # + fp32 scale bytes
         block_bytes = 2 * num_layers * self.block_size * num_kv_heads * per_head
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+        budget = int(total * config.gpu_memory_utilization - used - peak + current)
+        config.num_kvcache_blocks = budget // block_bytes
+        G = 1 << 30
+        print(f"[allocate_kv_cache] total={total/G:.2f}G util={config.gpu_memory_utilization} "
+              f"used={used/G:.2f}G peak={peak/G:.2f}G current(weights)={current/G:.2f}G "
+              f"| KV budget={budget/G:+.3f}G block={block_bytes/1e6:.2f}MB -> blocks={config.num_kvcache_blocks} "
+              f"(layers={num_layers}, need >0)")
+        assert config.num_kvcache_blocks > 0, (
+            f"no KV room: short by {-budget/G:.3f}G. free that much (lower a model, raise util, "
+            f"or quantize the eagle3 head) — see the breakdown above.")
         nb = config.num_kvcache_blocks
         self.kv_cache = torch.empty(2, num_layers, nb, self.block_size, num_kv_heads, cache_hd, dtype=cache_dtype)
         self.kv_scale = (torch.empty(2, num_layers, nb, self.block_size, num_kv_heads, scale_hd, dtype=torch.float32)
