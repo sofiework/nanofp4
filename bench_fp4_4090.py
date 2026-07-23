@@ -25,6 +25,7 @@ Prereqs on the 4090 (see fp4_spec_4090_plan.md):
 Run:  python bench_fp4_4090.py
 """
 import os, json, time, statistics
+import multiprocessing as mp
 import torch
 from nanovllm import LLM, SamplingParams
 
@@ -101,11 +102,27 @@ def run(cfg_name):
     return rows
 
 
+def _worker(name, q):
+    q.put(run(name))
+
+
 def main():
+    # Each config runs in its own spawned process: a second LLM in the same process would re-init the
+    # torch process group ("initialize... twice") and, worse, the first 20 GB model's VRAM would linger.
+    ctx = mp.get_context("spawn")
     results = {}
     for name in CONFIGS:
         print(f"=== {name} ===")
-        results[name] = run(name)
+        q = ctx.Queue()
+        p = ctx.Process(target=_worker, args=(name, q))
+        p.start()
+        p.join()
+        if p.exitcode == 0 and not q.empty():
+            results[name] = q.get()
+        else:
+            print(f"  !! {name} failed (exit {p.exitcode}); see traceback above — skipping")
+            results[name] = []
+    results = {k: v for k, v in results.items() if v}
     # aggregate
     def agg(rows, key):
         return round(statistics.mean(r[key] for r in rows), 2)
