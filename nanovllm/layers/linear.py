@@ -3,6 +3,9 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
+from nanovllm.layers.quant import get_quant_config
+from nanovllm.layers.nvfp4_gemm import nvfp4_linear
+
 
 def divide(numerator, denominator):
     assert numerator % denominator == 0
@@ -22,7 +25,18 @@ class LinearBase(nn.Module):
         self.tp_dim = tp_dim
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
-        self.weight = nn.Parameter(torch.empty(output_size, input_size))
+        qcfg = get_quant_config()
+        # NVFP4 kernel mode: hold packed 4-bit weight + per-group fp16 scale (global scale folded in
+        # at load). Only the target model is built with quant enabled; the eagle3 head stays bf16.
+        self.nvfp4 = qcfg.enabled
+        self.group_size = qcfg.group_size
+        if self.nvfp4:
+            assert input_size % 2 == 0 and input_size % self.group_size == 0
+            self.weight = nn.Parameter(torch.empty(output_size, input_size // 2, dtype=torch.uint8), requires_grad=False)
+            self.weight_scale = nn.Parameter(torch.empty(output_size, input_size // self.group_size, dtype=torch.float16), requires_grad=False)
+            self.weight_scale.weight_loader = self.weight_loader
+        else:
+            self.weight = nn.Parameter(torch.empty(output_size, input_size))
         self.weight.weight_loader = self.weight_loader
         if bias:
             self.bias = nn.Parameter(torch.empty(output_size))
@@ -32,6 +46,11 @@ class LinearBase(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
+
+    def _apply(self, x: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+        if self.nvfp4:
+            return nvfp4_linear(x, self.weight, self.weight_scale, bias, self.group_size)
+        return F.linear(x, self.weight, bias)
 
 
 class ReplicatedLinear(LinearBase):
@@ -48,7 +67,7 @@ class ReplicatedLinear(LinearBase):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+        return self._apply(x, self.bias)
 
 
 class ColumnParallelLinear(LinearBase):
@@ -70,7 +89,7 @@ class ColumnParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+        return self._apply(x, self.bias)
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
@@ -150,7 +169,7 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+        y = self._apply(x, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
             dist.all_reduce(y)
         return y

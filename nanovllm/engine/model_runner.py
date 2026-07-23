@@ -11,6 +11,7 @@ from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 from nanovllm.utils.eagle3 import Eagle3Proposer
+from nanovllm.layers.quant import set_weight_quant
 
 
 class ModelRunner:
@@ -19,8 +20,10 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
-        # eagle3 returns a tuple (aux) from the model -> cuda graph capture can't handle it; run eager
-        self.enforce_eager = config.enforce_eager or config.spec_method == "eagle3"
+        # eagle3 returns a tuple (aux) from the model -> cuda graph capture can't handle it; run eager.
+        # nvfp4 weights / quantized KV also run eager (triton dequant kernels, first-run path).
+        self.enforce_eager = (config.enforce_eager or config.spec_method == "eagle3"
+                              or config.weight_quant == "nvfp4" or config.kv_quant_target)
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
@@ -30,7 +33,20 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
+        # NVFP4 kernel-mode weights: enable quant before building the target model so its linears
+        # allocate packed uint8 params; disable right after so the eagle3 head (built below) is bf16.
+        nvfp4 = config.weight_quant == "nvfp4"
+        group_size = 16
+        if nvfp4:
+            qc = getattr(hf_config, "quantization_config", None)
+            try:
+                group_size = int(qc["config_groups"]["group_0"]["weights"]["group_size"])
+            except Exception:
+                group_size = 16
+            set_weight_quant(True, group_size)
         self.model = Qwen3ForCausalLM(hf_config)
+        self.model.nvfp4_group_size = group_size
+        set_weight_quant(False)
         load_model(self.model, config.model)
         self.sampler = Sampler()
 
@@ -39,9 +55,12 @@ class ModelRunner:
         self.aux_features: dict[int, tuple[torch.Tensor, int]] = {}
         self.proposer = None
         if config.spec_method == "eagle3":
-            self.proposer = Eagle3Proposer(self.model.model.embed_tokens)
+            self.proposer = Eagle3Proposer(self.model.model.embed_tokens, config.draft_model)
             self.proposer.load_weights(config.draft_model)
-            self.model.model.aux_layers = (1, 13, 24)
+            # aux layers = vLLM's (2, L//2, L-3) minus 1 (nano-vllm residual-stream offset, matched 1.7B):
+            # 28L -> (1,13,24); 64L (Qwen3-32B) -> (1,31,60)
+            L = hf_config.num_hidden_layers
+            self.model.model.aux_layers = (1, L // 2 - 1, L - 4)
 
         self.warmup_model()
         self.allocate_kv_cache()
@@ -122,20 +141,42 @@ class ModelRunner:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         num_layers = hf_config.num_hidden_layers + (1 if self.proposer is not None else 0)  # eagle3: +1 draft layer
-        block_bytes = 2 * num_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        # KV quant: single uniform pool dtype (Step-0 decision — no mixed bf16-draft/quant-target pool).
+        fmt = config.kv_quant_target
+        assert config.kv_quant_draft in ("", fmt), "mixed-pool KV quant unsupported; use uniform (draft==target)"
+        if fmt == "fp8":
+            cache_dtype, cache_hd, scale_hd = torch.float8_e4m3fn, head_dim, 1
+        elif fmt == "fp4":
+            cache_dtype, cache_hd, scale_hd = torch.uint8, head_dim // 2, head_dim // 16
+        else:
+            cache_dtype, cache_hd, scale_hd = hf_config.dtype, head_dim, 0
+        per_head = cache_hd * cache_dtype.itemsize + scale_hd * 4   # + fp32 scale bytes
+        block_bytes = 2 * num_layers * self.block_size * num_kv_heads * per_head
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, num_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        nb = config.num_kvcache_blocks
+        self.kv_cache = torch.empty(2, num_layers, nb, self.block_size, num_kv_heads, cache_hd, dtype=cache_dtype)
+        self.kv_scale = (torch.empty(2, num_layers, nb, self.block_size, num_kv_heads, scale_hd, dtype=torch.float32)
+                         if fmt else None)
+
+        def mount(module, layer_id):
+            module.k_cache = self.kv_cache[0, layer_id]
+            module.v_cache = self.kv_cache[1, layer_id]
+            module.kv_quant_fmt = fmt
+            if fmt:
+                # fp8 scale is per-(token,head); squeeze the trailing dim so the kernel indexes [.., KVH]
+                sq = (lambda t: t.squeeze(-1)) if fmt == "fp8" else (lambda t: t)
+                module.k_scale = sq(self.kv_scale[0, layer_id])
+                module.v_scale = sq(self.kv_scale[1, layer_id])
+
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
+                mount(module, layer_id)
                 layer_id += 1
         # proposer is not a submodule of self.model, so mount its draft-layer cache manually
         if self.proposer is not None:
-            self.proposer.midlayer.attn.k_cache = self.kv_cache[0, -1]
-            self.proposer.midlayer.attn.v_cache = self.kv_cache[1, -1]
+            mount(self.proposer.midlayer.attn, num_layers - 1)
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)

@@ -83,15 +83,27 @@ class Eagle3Midlayer(nn.Module):
 
 class Eagle3Proposer(nn.Module):
 
-    def __init__(self, embed_tokens: nn.Module, draft_vocab_size: int = 32000, hidden_size: int = 2048) -> None:
+    def __init__(self, embed_tokens: nn.Module, draft_path: str) -> None:
         super().__init__()
+        import json, os
+        cfg = json.load(open(os.path.join(draft_path, "config.json")))   # head dims (1.7B or 32B ...)
+        h = cfg["hidden_size"]
+        dvocab = cfg["draft_vocab_size"]
         self.embed_tokens = embed_tokens        # 共享 target 的 embedding, 不复制权重
-        self.fc = nn.Linear(3 * hidden_size, hidden_size, bias=False)
-        self.midlayer = Eagle3Midlayer(hidden_size=hidden_size)
-        self.norm = RMSNorm(hidden_size)
-        self.lm_head = nn.Linear(hidden_size, draft_vocab_size, bias=False)
-
-        self.register_buffer("d2t", torch.zeros(draft_vocab_size, dtype=torch.int64))
+        self.fc = nn.Linear(3 * h, h, bias=False)               # 3 aux layers -> hidden
+        self.midlayer = Eagle3Midlayer(
+            hidden_size=h,
+            num_heads=cfg["num_attention_heads"],
+            num_kv_heads=cfg["num_key_value_heads"],
+            head_dim=cfg["head_dim"],
+            intermediate_size=cfg["intermediate_size"],
+            rms_norm_eps=cfg.get("rms_norm_eps", 1e-6),
+            rope_theta=cfg.get("rope_theta", 1e6),
+            max_position=cfg.get("max_position_embeddings", 40960),
+        )
+        self.norm = RMSNorm(h)
+        self.lm_head = nn.Linear(h, dvocab, bias=False)
+        self.register_buffer("d2t", torch.zeros(dvocab, dtype=torch.int64))
 
     def load_weights(self, path: str):
         # head 是 pytorch_model.bin (fp16, key 带 midlayer. 前缀), 手动映射; copy_ 自动转 dtype/device

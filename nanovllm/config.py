@@ -23,6 +23,13 @@ class Config:
     spec_method: str = "ngram"     # "ngram" | "eagle3"
     draft_model: str = ""          # eagle3 draft-head weights path
 
+    # KV-cache quantization (fake-quant measurement hook: "" | "fp8" | "fp4")
+    kv_quant_target: str = ""      # target (main model) KV
+    kv_quant_draft: str = ""       # draft (eagle3) KV; "" = bf16
+
+    # weight quantization (fake-quant measurement: "" | "nvfp4"); target linears only, head stays bf16
+    weight_quant: str = ""
+
     def __post_init__(self):
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
