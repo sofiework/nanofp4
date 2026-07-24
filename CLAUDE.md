@@ -107,6 +107,9 @@
         1.7B 没暴露因为 target/draft head_dim 都 128。修复: allocate_kv_cache 给 draft 单独 pool
         (make_pool, 用 proposer.midlayer 的 d_kvh/d_hd), 与 target pool 共享 nb (同 block_table)。
         kernel 不用改 (store/read 从 tensor 读 head_dim)。1.7B 验证: 两 pool 路径 coherent, accept 1.49
+    (3) 但 draft head_dim=80 non-pow2 -> triton tl.arange 要求 pow2 -> fp4 store/read kernel 崩。
+        修复: head_dim 维度 pad 到 next_pow2 (NB_POW2 / D_POW2) + mask (head_dim=128 时 no-op 无 regression)。
+        head_dim 80/128 store+read roundtrip vs torch ref rel~2.5e-3; 1.7B eagle3 accept 1.51 无 regression
 
 ## priority scheduling design (user-decided)
 - scenario: 交互式 fast vs 批处理 normal, 用户可选 fast/normal mode (tiered)

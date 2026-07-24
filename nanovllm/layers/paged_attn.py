@@ -42,18 +42,22 @@ def _paged_attn_kernel(
     scale, num_kv_groups,
     stride_qn, stride_qh, stride_on, stride_oh, stride_bt,
     KVH: tl.constexpr, D: tl.constexpr, BLOCK: tl.constexpr, QUANT: tl.constexpr,
+    D_POW2: tl.constexpr,
 ):
     qr = tl.program_id(0)
     h = tl.program_id(1)
     seq = tl.load(QSEQ + qr)
     ctx = tl.load(QCTX + qr)
     kvh = h // num_kv_groups
-    d = tl.arange(0, D)
-    q = tl.load(Q + qr * stride_qn + h * stride_qh + d).to(tl.float32) * scale
+    # arange must be a power of 2; pad head_dim to D_POW2 and mask d<D (no-op when D is a power of 2, e.g.
+    # 128; needed for the eagle3 draft head_dim 80). Padded dims load/contribute 0 and are not stored.
+    d = tl.arange(0, D_POW2)
+    dm = d < D
+    q = tl.load(Q + qr * stride_qn + h * stride_qh + d, mask=dm, other=0.).to(tl.float32) * scale
 
     m_i = -float("inf")
     l_i = 0.0
-    acc = tl.zeros([D], dtype=tl.float32)
+    acc = tl.zeros([D_POW2], dtype=tl.float32)
     offs = tl.arange(0, BLOCK)
     Dp: tl.constexpr = D // 2
     Dg: tl.constexpr = D // 16
@@ -62,29 +66,30 @@ def _paged_attn_kernel(
         phys = tl.load(BT + seq * stride_bt + blk)
         tok = blk * BLOCK + offs
         mask = tok < ctx
+        kvmask = mask[:, None] & dm[None, :]             # token-in-ctx AND head_dim-in-D (pow2 pad)
         if QUANT == 0:                                   # bf16 / fp16
             ptr = phys * (BLOCK * KVH * D) + kvh * D + offs[:, None] * (KVH * D) + d[None, :]
-            k = tl.load(KC + ptr, mask=mask[:, None], other=0.0).to(tl.float32)
-            v = tl.load(VC + ptr, mask=mask[:, None], other=0.0).to(tl.float32)
+            k = tl.load(KC + ptr, mask=kvmask, other=0.0).to(tl.float32)
+            v = tl.load(VC + ptr, mask=kvmask, other=0.0).to(tl.float32)
         elif QUANT == 1:                                 # fp8 e4m3, per-(token,head) scale
             ptr = phys * (BLOCK * KVH * D) + kvh * D + offs[:, None] * (KVH * D) + d[None, :]
-            k = tl.load(KC + ptr, mask=mask[:, None], other=0.0).to(tl.float32)
-            v = tl.load(VC + ptr, mask=mask[:, None], other=0.0).to(tl.float32)
+            k = tl.load(KC + ptr, mask=kvmask, other=0.0).to(tl.float32)
+            v = tl.load(VC + ptr, mask=kvmask, other=0.0).to(tl.float32)
             sptr = phys * (BLOCK * KVH) + kvh + offs * KVH
             k = k * tl.load(KS + sptr, mask=mask, other=0.0)[:, None]
             v = v * tl.load(VS + sptr, mask=mask, other=0.0)[:, None]
         else:                                            # fp4 E2M1, per-(token,head,16-block) scale
             pidx = d >> 1
             bptr = phys * (BLOCK * KVH * Dp) + kvh * Dp + offs[:, None] * (KVH * Dp) + pidx[None, :]
-            kb = tl.load(KC + bptr, mask=mask[:, None], other=0)
-            vb = tl.load(VC + bptr, mask=mask[:, None], other=0)
+            kb = tl.load(KC + bptr, mask=kvmask, other=0)
+            vb = tl.load(VC + bptr, mask=kvmask, other=0)
             is_high = (d & 1)[None, :]
             k = tl.load(LUT + tl.where(is_high == 1, kb >> 4, kb & 0x0F))
             v = tl.load(LUT + tl.where(is_high == 1, vb >> 4, vb & 0x0F))
             gidx = d // 16
             sptr = phys * (BLOCK * KVH * Dg) + kvh * Dg + offs[:, None] * (KVH * Dg) + gidx[None, :]
-            k = k * tl.load(KS + sptr, mask=mask[:, None], other=0.0)
-            v = v * tl.load(VS + sptr, mask=mask[:, None], other=0.0)
+            k = k * tl.load(KS + sptr, mask=kvmask, other=0.0)
+            v = v * tl.load(VS + sptr, mask=kvmask, other=0.0)
 
         s = tl.where(mask, tl.sum(q[None, :] * k, axis=1), -float("inf"))
         m_new = tl.maximum(m_i, tl.max(s, axis=0))
@@ -94,7 +99,7 @@ def _paged_attn_kernel(
         acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
         m_i = m_new
 
-    tl.store(O + qr * stride_on + h * stride_oh + d, (acc / l_i).to(O.dtype.element_ty))
+    tl.store(O + qr * stride_on + h * stride_oh + d, (acc / l_i).to(O.dtype.element_ty), mask=dm)
 
 
 _QUANT_CODE = {"": 0, "fp8": 1, "fp4": 2}
@@ -111,7 +116,7 @@ def paged_attn(q, k_cache, v_cache, block_tables, q_seq, q_ctx, scale,
         q, k_cache, v_cache, k_scale, v_scale, block_tables, q_seq, q_ctx, _lut(q.device), o,
         scale, H // KVH,
         q.stride(0), q.stride(1), o.stride(0), o.stride(1), block_tables.stride(0),
-        KVH=KVH, D=D, BLOCK=BLOCK, QUANT=_QUANT_CODE[fmt],
+        KVH=KVH, D=D, BLOCK=BLOCK, QUANT=_QUANT_CODE[fmt], D_POW2=triton.next_power_of_2(D),
     )
     return o
 
@@ -163,7 +168,7 @@ def _fp4_pack(e, o):
 
 @triton.jit
 def _store_kv_fp4_kernel(K, V, KC, VC, KS, VS, SLOT,
-                         s_n, s_h, sc_s, sc_h, ss_s, ss_h, NB: tl.constexpr):
+                         s_n, s_h, sc_s, sc_h, ss_s, ss_h, NB: tl.constexpr, NB_POW2: tl.constexpr):
     # one program per (token, kv_head). -1 slot -> skip (in-kernel branch, no host sync) so the grid is
     # fixed [n, KVH] and the launch is CUDA-graph-capturable (unlike the boolean-mask torch path).
     t = tl.program_id(0)
@@ -171,19 +176,25 @@ def _store_kv_fp4_kernel(K, V, KC, VC, KS, VS, SLOT,
     slot = tl.load(SLOT + t)
     if slot == -1:
         return
-    nb = tl.arange(0, NB)[:, None]          # block index within head_dim
+    # NB = head_dim/16 blocks. arange must be a power of 2, so pad to NB_POW2 and mask nb<NB
+    # (no-op when NB is already a power of 2, e.g. head_dim 128 -> 8; needed for head_dim 80 -> 5).
+    nb = tl.arange(0, NB_POW2)[:, None]     # block index within head_dim
     p = tl.arange(0, 8)[None, :]            # pair index within a 16-block
+    m = nb < NB
     even = nb * 16 + p * 2
     odd = even + 1
     off_in = t * s_n + h * s_h
     pk = nb * 8 + p                          # packed byte position (D//2)
-    ks_idx = tl.arange(0, NB)
-    kp, ks = _fp4_pack(tl.load(K + off_in + even).to(tl.float32), tl.load(K + off_in + odd).to(tl.float32))
-    tl.store(KC + slot * sc_s + h * sc_h + pk, kp)
-    tl.store(KS + slot * ss_s + h * ss_h + ks_idx, ks)
-    vp, vs = _fp4_pack(tl.load(V + off_in + even).to(tl.float32), tl.load(V + off_in + odd).to(tl.float32))
-    tl.store(VC + slot * sc_s + h * sc_h + pk, vp)
-    tl.store(VS + slot * ss_s + h * ss_h + ks_idx, vs)
+    ks_idx = tl.arange(0, NB_POW2)
+    ksm = ks_idx < NB
+    kp, ks = _fp4_pack(tl.load(K + off_in + even, mask=m, other=0.).to(tl.float32),
+                       tl.load(K + off_in + odd, mask=m, other=0.).to(tl.float32))
+    tl.store(KC + slot * sc_s + h * sc_h + pk, kp, mask=m)
+    tl.store(KS + slot * ss_s + h * ss_h + ks_idx, ks, mask=ksm)
+    vp, vs = _fp4_pack(tl.load(V + off_in + even, mask=m, other=0.).to(tl.float32),
+                       tl.load(V + off_in + odd, mask=m, other=0.).to(tl.float32))
+    tl.store(VC + slot * sc_s + h * sc_h + pk, vp, mask=m)
+    tl.store(VS + slot * ss_s + h * ss_h + ks_idx, vs, mask=ksm)
 
 
 @torch.no_grad()
@@ -200,7 +211,7 @@ def store_kv_quant(k, v, k_cache, v_cache, k_scale, v_scale, slot_mapping, fmt):
         _store_kv_fp4_kernel[(n, KVH)](
             k, v, kc, vc, ks_, vs_, slot_mapping,
             k.stride(0), k.stride(1), kc.stride(0), kc.stride(1), ks_.stride(0), ks_.stride(1),
-            NB=D // 16,
+            NB=D // 16, NB_POW2=triton.next_power_of_2(D // 16),
         )
         return
     # fp8: torch path (boolean mask, not graph-capturable -> fp8-KV runs eager).
