@@ -96,6 +96,17 @@
         (c) bench enforce_eager=False + max_num_seqs=8。坑: store kernel 假设 head_dim contiguous, 但
         decode k/v 是 qkv-split view -> 必须 .contiguous()。1.7B 本地验证: graph 19->32.9 tok/s = 1.73x,
         coherent, 全 correctness test pass。fp8-KV store 仍 boolean-mask torch (不 capturable, fp8 走 eager)
+  - 32B no_spec 结果 (4090): 1.7 -> 5.4 (arithmetic decode) -> **10.3 tok/s** (CUDA graph, 6x total),
+    ITL 101ms, steady TTFT ~215-270ms。decode 与 AdaLLM parity (Gemma3-27B 13.6 -> ~11.5 scaled)。
+    prefill/TTFT 仍 3-5x vs fp16 (未做 fp8-TC)。vs H100+fp8 ~5-7x 慢 (主要是 3.3x BW gap, fp8 装不下 24G)
+  - eagle3 fit + draft KV head_dim mismatch (Claude 代写):
+    (1) fit: 头 ~1.7G + extra KV layer -> util 0.95 + batched 256 才装下 (KV budget +1.13G, 47 blocks);
+        model_runner allocate_kv_cache 加显存 breakdown print (total/used/peak/current/budget/block/blocks)
+    (2) draft KV head_dim mismatch bug: 单一 uniform KV pool 按 target head_dim (Qwen3-32B=128) sized,
+        但 AngelSlim eagle3 draft head head_dim=80 (eagle3.py 读 cfg head_dim) -> draft store view 崩。
+        1.7B 没暴露因为 target/draft head_dim 都 128。修复: allocate_kv_cache 给 draft 单独 pool
+        (make_pool, 用 proposer.midlayer 的 d_kvh/d_hd), 与 target pool 共享 nb (同 block_table)。
+        kernel 不用改 (store/read 从 tensor 读 head_dim)。1.7B 验证: 两 pool 路径 coherent, accept 1.49
 
 ## priority scheduling design (user-decided)
 - scenario: 交互式 fast vs 批处理 normal, 用户可选 fast/normal mode (tiered)

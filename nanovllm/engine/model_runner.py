@@ -142,51 +142,76 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        num_layers = hf_config.num_hidden_layers + (1 if self.proposer is not None else 0)  # eagle3: +1 draft layer
-        # KV quant: single uniform pool dtype (Step-0 decision — no mixed bf16-draft/quant-target pool).
+        num_layers = hf_config.num_hidden_layers
+        # KV quant: single uniform dtype (Step-0 decision — no mixed bf16-draft/quant-target pool).
         fmt = config.kv_quant_target
         assert config.kv_quant_draft in ("", fmt), "mixed-pool KV quant unsupported; use uniform (draft==target)"
-        if fmt == "fp8":
-            cache_dtype, cache_hd, scale_hd = torch.float8_e4m3fn, head_dim, 1
-        elif fmt == "fp4":
-            cache_dtype, cache_hd, scale_hd = torch.uint8, head_dim // 2, head_dim // 16
-        else:
-            cache_dtype, cache_hd, scale_hd = hf_config.dtype, head_dim, 0
-        per_head = cache_hd * cache_dtype.itemsize + scale_hd * 4   # + fp32 scale bytes
-        block_bytes = 2 * num_layers * self.block_size * num_kv_heads * per_head
+        cache_dtype = {"fp8": torch.float8_e4m3fn, "fp4": torch.uint8}.get(fmt, hf_config.dtype)
+
+        def dims(hd):
+            # (cache_hd, scale_hd) for one kv head at a given head_dim under the current fmt
+            if fmt == "fp8":
+                return hd, 1                       # e4m3, per-(token,head) scale
+            if fmt == "fp4":
+                return hd // 2, hd // 16           # 2 codes/byte, per-16-block scale
+            return hd, 0
+
+        def block_bytes(n_layers, kvh, hd):
+            chd, shd = dims(hd)
+            return 2 * n_layers * self.block_size * kvh * (chd * cache_dtype.itemsize + shd * 4)
+
+        # target pool + (if eagle3) a SEPARATE draft pool: the draft head can have a different head_dim
+        # (Qwen3-32B target head_dim 128 vs AngelSlim eagle3 head 80), so it can't share the target pool.
+        # Both pools use the same block count nb (indexed by the same seq.block_table).
+        tgt_bb = block_bytes(num_layers, num_kv_heads, head_dim)
+        d_kvh = d_hd = None
+        drf_bb = 0
+        if self.proposer is not None:
+            d_kvh = self.proposer.midlayer.num_kv_heads // self.world_size
+            d_hd = self.proposer.midlayer.head_dim
+            drf_bb = block_bytes(1, d_kvh, d_hd)
         budget = int(total * config.gpu_memory_utilization - used - peak + current)
-        config.num_kvcache_blocks = budget // block_bytes
+        config.num_kvcache_blocks = budget // (tgt_bb + drf_bb)
         G = 1 << 30
         print(f"[allocate_kv_cache] total={total/G:.2f}G util={config.gpu_memory_utilization} "
               f"used={used/G:.2f}G peak={peak/G:.2f}G current(weights)={current/G:.2f}G "
-              f"| KV budget={budget/G:+.3f}G block={block_bytes/1e6:.2f}MB -> blocks={config.num_kvcache_blocks} "
-              f"(layers={num_layers}, need >0)")
+              f"| KV budget={budget/G:+.3f}G block={(tgt_bb+drf_bb)/1e6:.2f}MB -> blocks={config.num_kvcache_blocks} "
+              f"(target_layers={num_layers} head_dim={head_dim}"
+              f"{f', draft head_dim={d_hd}' if self.proposer is not None else ''}, need >0)")
         assert config.num_kvcache_blocks > 0, (
             f"no KV room: short by {-budget/G:.3f}G. free that much (lower a model, raise util, "
             f"or quantize the eagle3 head) — see the breakdown above.")
         nb = config.num_kvcache_blocks
-        self.kv_cache = torch.empty(2, num_layers, nb, self.block_size, num_kv_heads, cache_hd, dtype=cache_dtype)
-        self.kv_scale = (torch.empty(2, num_layers, nb, self.block_size, num_kv_heads, scale_hd, dtype=torch.float32)
-                         if fmt else None)
 
-        def mount(module, layer_id):
-            module.k_cache = self.kv_cache[0, layer_id]
-            module.v_cache = self.kv_cache[1, layer_id]
+        def make_pool(n_layers, kvh, hd):
+            chd, shd = dims(hd)
+            cache = torch.empty(2, n_layers, nb, self.block_size, kvh, chd, dtype=cache_dtype)
+            scale = (torch.empty(2, n_layers, nb, self.block_size, kvh, shd, dtype=torch.float32) if fmt else None)
+            return cache, scale
+
+        self.kv_cache, self.kv_scale = make_pool(num_layers, num_kv_heads, head_dim)
+        self.draft_kv_cache = self.draft_kv_scale = None
+        if self.proposer is not None:
+            self.draft_kv_cache, self.draft_kv_scale = make_pool(1, d_kvh, d_hd)
+
+        def mount(module, cache, scale, layer_id):
+            module.k_cache = cache[0, layer_id]
+            module.v_cache = cache[1, layer_id]
             module.kv_quant_fmt = fmt
             if fmt:
                 # fp8 scale is per-(token,head); squeeze the trailing dim so the kernel indexes [.., KVH]
                 sq = (lambda t: t.squeeze(-1)) if fmt == "fp8" else (lambda t: t)
-                module.k_scale = sq(self.kv_scale[0, layer_id])
-                module.v_scale = sq(self.kv_scale[1, layer_id])
+                module.k_scale = sq(scale[0, layer_id])
+                module.v_scale = sq(scale[1, layer_id])
 
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                mount(module, layer_id)
+                mount(module, self.kv_cache, self.kv_scale, layer_id)
                 layer_id += 1
-        # proposer is not a submodule of self.model, so mount its draft-layer cache manually
+        # proposer is not a submodule of self.model, so mount its draft-layer cache (own pool) manually
         if self.proposer is not None:
-            mount(self.proposer.midlayer.attn, num_layers - 1)
+            mount(self.proposer.midlayer.attn, self.draft_kv_cache, self.draft_kv_scale, 0)
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
