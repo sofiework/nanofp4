@@ -12,6 +12,7 @@ from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 from nanovllm.utils.eagle3 import Eagle3Proposer
 from nanovllm.layers.quant import set_weight_quant
+from nanovllm.layers.paged_attn import paged_attn, store_kv_quant
 
 
 class ModelRunner:
@@ -131,7 +132,57 @@ class ModelRunner:
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
         self.run(seqs, True)
+        self._warmup_quant_kernels()
         torch.cuda.empty_cache()
+
+    @torch.inference_mode()
+    def _warmup_quant_kernels(self):
+        """Force JIT-compile + first-launch of the quant kernels the full-prefill warmup above misses,
+        so allocate_kv_cache's free-memory budget accounts for their one-time driver reservation
+        (module + per-thread local memory scaled by SM count). Without this the target paged-attn read
+        (first fired in run_verify) and the split-K GEMV (M<=64) reserve device memory *after* the KV
+        pool is already sized, which OOMs the launch itself at a tight gpu_memory_utilization (0.95).
+        No-op when no quant kernel is in play; freed dummies are reclaimed by the caller's empty_cache
+        while the persistent driver reservation stays visible to mem_get_info."""
+        hf_config = self.config.hf_config
+        fmt = self.config.kv_quant_target
+        if self.config.weight_quant != "nvfp4" and not fmt:
+            return
+        # nvfp4 split-K GEMV: a 1-token prefill (M=1 <= 64 -> _nvfp4_gemv_kernel). Attention stays on
+        # flash-attn (caches empty until allocate_kv_cache), so no mounted cache is needed.
+        if self.config.weight_quant == "nvfp4":
+            seq = Sequence([0])
+            seq.num_scheduled_tokens = 1
+            self.run([seq], True)
+        # paged-attn read (+ fp4 store) for each pool's exact (KVH, D, BLOCK, QUANT, D_POW2) spec.
+        if fmt:
+            block = self.block_size
+            head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+            dims = [(hf_config.num_attention_heads // self.world_size,
+                     hf_config.num_key_value_heads // self.world_size, head_dim)]
+            if self.proposer is not None:
+                m = self.proposer.midlayer
+                dims.append((m.num_heads, m.num_kv_heads // self.world_size, m.head_dim))
+            for H, KVH, D in dims:
+                q = torch.zeros(1, H, D, dtype=hf_config.dtype)
+                if fmt == "fp4":
+                    kc = torch.zeros(1, block, KVH, D // 2, dtype=torch.uint8)
+                    vc = torch.zeros(1, block, KVH, D // 2, dtype=torch.uint8)
+                    ks = torch.zeros(1, block, KVH, D // 16, dtype=torch.float32)
+                    vs = torch.zeros(1, block, KVH, D // 16, dtype=torch.float32)
+                else:    # fp8
+                    kc = torch.zeros(1, block, KVH, D, dtype=torch.float8_e4m3fn)
+                    vc = torch.zeros(1, block, KVH, D, dtype=torch.float8_e4m3fn)
+                    ks = torch.zeros(1, block, KVH, dtype=torch.float32)
+                    vs = torch.zeros(1, block, KVH, dtype=torch.float32)
+                bt = torch.zeros(1, 1, dtype=torch.int32)
+                q_seq = torch.zeros(1, dtype=torch.int32)
+                q_ctx = torch.ones(1, dtype=torch.int32)
+                paged_attn(q, kc, vc, bt, q_seq, q_ctx, D ** -0.5, fmt, ks, vs)
+                if fmt == "fp4":    # fp4 store kernel (per-pool NB/NB_POW2 spec); fp8 store is plain torch
+                    kv = torch.zeros(1, KVH, D, dtype=hf_config.dtype)
+                    store_kv_quant(kv, kv, kc, vc, ks, vs, torch.zeros(1, dtype=torch.int32), fmt)
+                del q, kc, vc, ks, vs, bt, q_seq, q_ctx
 
     def allocate_kv_cache(self):
         config = self.config
