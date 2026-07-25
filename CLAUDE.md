@@ -143,6 +143,20 @@
       (util 0.90 -> 57 blocks 14.6k tok, graph OK; 更高 util graph headroom 紧, enforce_eager 可推)
     - 推荐 no_spec config: weight nvfp4 + weight_scale_fp8 + kv fp4 + kv_scale_fp8 + util 0.90 + mnbt 256
       + graph -> 14.6k ctx, 800 tok/s prefill
+  - decode optimization (2026-07-25, PR branch kernel-opt-fp4-decode, spec 仍禁用):
+    - nsys decode 分解 (ctx=512): _nvfp4_gemv_kernel 51.7% + _paged_attn_kernel 45.7% (各半)。graph vs
+      eager 140 vs 154ms 约等 -> 非 launch-bound 是真 GPU work。两个都是 **memory-layout coalescing** 问题
+      (不是 arithmetic decode): (1) GEMV 读 packed weight [N,K/2] 的 N 维 stride=K/2 uncoalesced -> 215 GB/s
+      (21% peak, fp16 parity); (2) paged attn token-major KV 读单 head stride=KVH*dim + bs=1 只 64 program
+      latency-starved (split-KV 不救, 是 layout 非 occupancy)
+    - 修复 (Claude 代写, 4090 验过): (a) per-row decode kernel num_warps 4->8 (latency hiding);
+      (b) **weight relayout [N,K/2]->[K/2,N]** (relayout_nvfp4_weights, load 后一次性 transpose, N 变
+      contiguous -> GEMV 读 coalesce; nvfp4_linear auto-detect layout, kernel+loader 不改)。correctness:
+      relaid vs legacy vs dequant-matmul <=2e-3, 全模型输出 byte-identical
+    - 结果 (util 0.90, fp8 scale, graph): **decode 512/1024/2048 = 16.6/14.5/11.5 tok/s** (baseline 7.1/6/3.9,
+      2.3-3x, **超过 AdaLLM 13.6**)。relayout 连带 prefill 0.87->1.4k tok/s @512。
+    - 残留: paged attn 仍占 decode ~35% (token-major KV); head-major KV layout [block,head,token,dim] 可再
+      coalesce -> 下一个 layout lever
 
 ## priority scheduling design (user-decided)
 - scenario: 交互式 fast vs 批处理 normal, 用户可选 fast/normal mode (tiered)
