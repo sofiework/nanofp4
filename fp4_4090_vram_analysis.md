@@ -194,3 +194,35 @@ util 0.90 is the safe graphed point; push higher with `enforce_eager=True` (lose
 ### Recommended no_spec config (optimized)
 `weight_quant=nvfp4, weight_scale_fp8=True, kv_quant_target=fp4, kv_scale_fp8=True, util=0.90,
 max_num_batched_tokens=256, enforce_eager=False` → 14.6k ctx, ~800 tok/s prefill, coherent.
+
+---
+
+## 8. Decode optimization (2026-07-25) — profiling-driven, weight relayout
+
+**nsys decode breakdown** (eager, ctx=512) settled the target: `_nvfp4_gemv_kernel` **51.7%** + `_paged_attn_kernel`
+**45.7%** — decode is half weight-GEMV, half paged-attention, both memory-inefficient at bs=1/M=1.
+Graph vs eager (140 vs 154 ms) ≈ equal → not launch-bound, it's real GPU work.
+
+Root causes (both **memory-layout coalescing**, not the arithmetic-decode tweak):
+1. **GEMV**: packed weight `[N, K/2]` → the M=1 GEMV reads the N dim with **stride K/2 (uncoalesced)** →
+   ~215 GB/s (21% of the 4090's ~1 TB/s), *parity with fp16* (i.e. reads 4× less data but same time).
+2. **Paged attn**: token-major KV `[block, token, head, dim]` → one head's tokens are **stride KVH·dim apart**;
+   only 64 programs at bs=1 → latency-starved. (split-KV did NOT help — layout/latency, not occupancy.)
+
+Fixes:
+- **`num_warps` 4→8** on the per-row decode kernel (more concurrent memory requests → latency hiding).
+- **Weight relayout `[N,K/2]→[K/2,N]`** (`relayout_nvfp4_weights`, one-time post-load transpose): N becomes
+  contiguous → the GEMV weight read **coalesces**. `nvfp4_linear` auto-detects the layout; kernels + the
+  (shard-aware) loaders are untouched. Correct: relaid vs legacy vs dequant-matmul ≤2e-3; output byte-identical.
+
+### Decode tok/s (util 0.90, fp8 scale, CUDA graph)
+| ctx | baseline (warps4) | +warps8 | **+relayout** | vs baseline |
+|---|---|---|---|---|
+| 512 | 7.1 | 11.0 | **16.6** | 2.3× |
+| 1024 | ~6 | 10.0 | **14.5** | ~2.4× |
+| 2048 | 3.9 | 8.5 | **11.5** | 3.0× |
+
+**16.6 tok/s @512 exceeds AdaLLM's 13.6** (Gemma3-27B). Relayout also lifted **prefill 0.87→1.4k tok/s** @512
+(coalescing helps the GEMM). Remaining: paged-attn is still ~35% of decode (token-major KV); a **head-major
+KV layout** ([block, head, token, dim]) would coalesce it further — the next layout lever if decode-at-long-
+context matters.
