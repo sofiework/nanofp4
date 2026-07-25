@@ -50,6 +50,10 @@ class ModelRunner:
         self.model.nvfp4_scale_fp8 = nvfp4 and config.weight_scale_fp8
         set_weight_quant(False)
         load_model(self.model, config.model)
+        if nvfp4:
+            # transpose packed weights to N-contiguous [K/2, N] so the decode GEMV read coalesces
+            from nanovllm.layers.nvfp4_gemm import relayout_nvfp4_weights
+            relayout_nvfp4_weights(self.model)
         self.sampler = Sampler()
 
         # eagle3 draft head (proposer weights must be resident before allocate_kv_cache sizes the pool)
