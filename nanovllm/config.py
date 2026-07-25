@@ -26,6 +26,10 @@ class Config:
     # KV-cache quantization (fake-quant measurement hook: "" | "fp8" | "fp4")
     kv_quant_target: str = ""      # target (main model) KV
     kv_quant_draft: str = ""       # draft (eagle3) KV; "" = bf16
+    # store the fp4 KV per-16-block scale as fp8_e4m3 instead of fp32 — cuts KV 96->72 KB/token (-25%)
+    # and halves the scale gather in the paged read kernel. fp8 load/store needs sm_89 (4090); keep False
+    # on sm_86 (fp32 scale stays byte-exact for local regression). No effect unless kv_quant_target=="fp4".
+    kv_scale_fp8: bool = False
 
     # weight quantization (fake-quant measurement: "" | "nvfp4"); target linears only, head stays bf16
     weight_quant: str = ""

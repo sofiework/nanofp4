@@ -1,0 +1,17 @@
+{"kind":"vram_component","name":"no_spec","weights_total_G":19.264,"packed_weight_u8_G":14.5312,"weight_scale_fp8_G":1.8164,"weight_scale_2_G":0.0171,"embed_tokens_G":1.449,"lm_head_G":1.449,"norms_G":0.0013,"tied_embed":false,"cuda_ctx_G":0.66,"fp4_kv_block_MB":25.17,"fp4_kv_per_token_KB":96,"spike_mnbt256_G":0.06,"spike_mnbt2048_G":0.46,"total_usable_G":23.516}
+{"kind":"vram_component","name":"eagle3","weights_total_G":20.83,"eagle3_head_extra_G":1.57,"draft_kv_block_MB":0.24,"cuda_ctx_G":0.67}
+{"kind":"sweep","name":"no_spec","util":0.90,"blocks":43,"max_ctx_tok":11008,"post_init_free_G":0.98,"runs":true}
+{"kind":"sweep","name":"no_spec","util":0.92,"blocks":63,"max_ctx_tok":16128,"post_init_free_G":0.51,"runs":true,"recommended":true}
+{"kind":"sweep","name":"no_spec","util":0.94,"blocks":83,"max_ctx_tok":21248,"post_init_free_G":0.043,"runs":true,"note":"fragile"}
+{"kind":"sweep","name":"eagle3","util":0.90,"blocks":-17,"runs":false,"reason":"budget<0 assert"}
+{"kind":"sweep","name":"eagle3","util":0.92,"blocks":3,"max_ctx_tok":768,"post_init_free_G":1.95,"runs":true,"prefill512_ok":true}
+{"kind":"sweep","name":"eagle3","util":0.93,"blocks":13,"max_ctx_tok":3328,"post_init_free_G":1.71,"runs":true,"prefill512_ok":true,"recommended":true}
+{"kind":"sweep","name":"eagle3","util":0.94,"blocks":23,"max_ctx_tok":5888,"post_init_free_G":1.48,"tiny_gen_ok":true,"prefill512_ok":false,"reason":"OOM on 512 prefill"}
+{"kind":"sweep","name":"eagle3","util":0.95,"blocks":33,"runs":false,"reason":"OOM (expandable_segments did not help)"}
+{"kind":"timing","name":"no_spec","util":0.92,"plen":256,"ttft_ms":1432.2,"prefill_tok_s":178.8,"decode_tok_s":9.94,"itl_p50_ms":100.54}
+{"kind":"timing","name":"no_spec","util":0.92,"plen":512,"ttft_ms":11040.1,"prefill_tok_s":46.4,"decode_tok_s":8.88,"itl_p50_ms":112.62}
+{"kind":"timing","name":"no_spec","util":0.92,"plen":1024,"ttft_ms":37035.2,"prefill_tok_s":27.6,"decode_tok_s":7.29,"itl_p50_ms":137.15}
+{"kind":"timing","name":"no_spec","util":0.92,"plen":2048,"ttft_ms":184322.0,"prefill_tok_s":11.1,"decode_tok_s":5.36,"itl_p50_ms":186.59}
+{"kind":"timing","name":"eagle3","util":0.93,"plen":512,"gen":64,"ttft_ms":13925.3,"prefill_tok_s":36.8,"decode_tok_s":9.3,"itl_p50_ms":209.84,"itl_p99_ms":1347.78,"accept_len":2.52}
+{"kind":"gemm_microbench","M":1,"phase":"decode","nvfp4_vs_fp16":"~1.0x","bw_gb_s":"250-270"}
+{"kind":"gemm_microbench","M":512,"phase":"prefill","nvfp4_vs_fp16":"3.2-5.2x","bw_gb_s":"14-23"}

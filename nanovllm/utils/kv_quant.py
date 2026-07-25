@@ -7,7 +7,7 @@ _FP4_BLOCK = 16   # NVFP4 micro-block size along head_dim
 
 
 @torch.no_grad()
-def fake_quant_kv(x: torch.Tensor, fmt: str) -> torch.Tensor:
+def fake_quant_kv(x: torch.Tensor, fmt: str, scale_fp8: bool = False) -> torch.Tensor:
     """Quant->dequant round-trip of a KV tensor x = [N, H, D] (N=token, H=kv_heads, D=head_dim).
 
     Injects exactly the error a real low-bit KV store would read back, so ACCEPT RATE is
@@ -30,6 +30,8 @@ def fake_quant_kv(x: torch.Tensor, fmt: str) -> torch.Tensor:
         assert D % _FP4_BLOCK == 0, f"head_dim {D} not divisible by fp4 block {_FP4_BLOCK}"
         xb = xf.reshape(N, H, D // _FP4_BLOCK, _FP4_BLOCK)
         scale = (xb.abs().amax(dim=-1, keepdim=True) / _E2M1[-1]).clamp_min(1e-12)
+        if scale_fp8:                                    # match the fp8_e4m3 scale pool rounding
+            scale = scale.to(torch.float8_e4m3fn).float().clamp_min(1e-12)
         xs = xb / scale
         grid = _E2M1.to(x.device)
         mid = (grid[1:] + grid[:-1]) / 2                 # round-to-nearest thresholds

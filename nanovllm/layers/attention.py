@@ -73,6 +73,7 @@ class Attention(nn.Module):
         # real KV quant: format ("" | "fp8" | "fp4") + per-token(-head/-block) scale caches;
         # all set per-layer by ModelRunner.allocate_kv_cache.
         self.kv_quant_fmt = ""
+        self.kv_scale_fp8 = False        # fp4 scale stored fp8_e4m3 (set by ModelRunner.allocate_kv_cache)
         self.k_scale = self.v_scale = None
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
@@ -92,10 +93,10 @@ class Attention(nn.Module):
                 # chunked-prefill continuation / prefix cache / spec-verify: read quantized paged cache
                 q_seq, q_ctx = _varlen_query_map(context)
                 o = paged_attn(q, k_cache, v_cache, context.block_tables, q_seq, q_ctx, self.scale,
-                               fmt, self.k_scale, self.v_scale)
+                               fmt, self.k_scale, self.v_scale, prefill=True)
             else:
                 if fmt:    # fresh full prefill: attend on in-hand k,v (fake-quant to match stored cache)
-                    k, v = fake_quant_kv(k, fmt), fake_quant_kv(v, fmt)
+                    k, v = fake_quant_kv(k, fmt, self.kv_scale_fp8), fake_quant_kv(v, fmt, self.kv_scale_fp8)
                 elif context.block_tables is not None:    # bf16 prefix cache
                     k, v = k_cache, v_cache
                 o = flash_attn_varlen_func(q, k, v,

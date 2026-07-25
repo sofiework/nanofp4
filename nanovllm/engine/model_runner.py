@@ -147,6 +147,10 @@ class ModelRunner:
         fmt = config.kv_quant_target
         assert config.kv_quant_draft in ("", fmt), "mixed-pool KV quant unsupported; use uniform (draft==target)"
         cache_dtype = {"fp8": torch.float8_e4m3fn, "fp4": torch.uint8}.get(fmt, hf_config.dtype)
+        # fp4 per-16-block scale: fp8_e4m3 (1 B, -25% KV) if kv_scale_fp8 else fp32. fp8-KV format keeps its
+        # per-(token,head) scale fp32. The paged kernels bitcast fp8<->value via a uint8 view (sm_89 only).
+        self.kv_scale_fp8 = bool(config.kv_scale_fp8 and fmt == "fp4")
+        scale_dtype = torch.float8_e4m3fn if self.kv_scale_fp8 else torch.float32
 
         def dims(hd):
             # (cache_hd, scale_hd) for one kv head at a given head_dim under the current fmt
@@ -158,7 +162,7 @@ class ModelRunner:
 
         def block_bytes(n_layers, kvh, hd):
             chd, shd = dims(hd)
-            return 2 * n_layers * self.block_size * kvh * (chd * cache_dtype.itemsize + shd * 4)
+            return 2 * n_layers * self.block_size * kvh * (chd * cache_dtype.itemsize + shd * scale_dtype.itemsize)
 
         # target pool + (if eagle3) a SEPARATE draft pool: the draft head can have a different head_dim
         # (Qwen3-32B target head_dim 128 vs AngelSlim eagle3 head 80), so it can't share the target pool.
@@ -186,7 +190,7 @@ class ModelRunner:
         def make_pool(n_layers, kvh, hd):
             chd, shd = dims(hd)
             cache = torch.empty(2, n_layers, nb, self.block_size, kvh, chd, dtype=cache_dtype)
-            scale = (torch.empty(2, n_layers, nb, self.block_size, kvh, shd, dtype=torch.float32) if fmt else None)
+            scale = (torch.empty(2, n_layers, nb, self.block_size, kvh, shd, dtype=scale_dtype) if fmt else None)
             return cache, scale
 
         self.kv_cache, self.kv_scale = make_pool(num_layers, num_kv_heads, head_dim)
@@ -198,6 +202,7 @@ class ModelRunner:
             module.k_cache = cache[0, layer_id]
             module.v_cache = cache[1, layer_id]
             module.kv_quant_fmt = fmt
+            module.kv_scale_fp8 = self.kv_scale_fp8
             if fmt:
                 # fp8 scale is per-(token,head); squeeze the trailing dim so the kernel indexes [.., KVH]
                 sq = (lambda t: t.squeeze(-1)) if fmt == "fp8" else (lambda t: t)
