@@ -31,7 +31,12 @@ class Sequence:
         self.ignore_eos = sampling_params.ignore_eos
 
         # speculative decoding: drafts proposed for the current step
-        self.draft_tokens: list[int] = []
+        self.draft_tokens: list[int] = []          # ngram: flat chain of draft tokens
+        # eagle3 tree: per-node draft token ids (node 0 = root = last_token, filled at verify time),
+        # plus the accepted branch (flat node indices) and the pre-verify cache base set by postprocess.
+        self.draft_tree_tokens: list[int] = []
+        self.accepted_path: list[int] = []
+        self.spec_base: int = 0
 
     def __len__(self):
         return self.num_tokens

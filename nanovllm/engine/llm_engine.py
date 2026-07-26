@@ -53,30 +53,32 @@ class LLMEngine:
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         eagle3 = self.scheduler.k and self.config.spec_method == "eagle3"
         if self.scheduler.k and not is_prefill:
-            # speculative decode: propose drafts, verify them, accept/reject
-            if self.config.spec_method == "ngram":
+            # speculative decode: verify the drafts proposed last step, accept/reject
+            if eagle3:
+                decode_verify = self.model_runner.call("run_verify_tree", seqs)
+                self.scheduler.postprocess_spec_tree(seqs, decode_verify)
+                live = [s for s in seqs if not s.is_finished]
+                self.model_runner.call("finalize_verify", live)   # gather accepted KV + stash aux
+                self._eagle3_propose(live)
+            else:   # ngram: dynamic chain
                 for seq in seqs:
                     seq.draft_tokens = propose_draft(seq.token_ids, self.scheduler.k, n=3)
-            # eagle3 drafts were proposed at the end of the previous step
-            decode_verify = self.model_runner.call("run_verify", seqs)
-            self.scheduler.postprocess_spec(seqs, decode_verify)
-            if eagle3:
-                self._eagle3_propose(seqs)
+                decode_verify = self.model_runner.call("run_verify", seqs)
+                self.scheduler.postprocess_spec(seqs, decode_verify)
         else:
             token_ids = self.model_runner.call("run", seqs, is_prefill)
             self.scheduler.postprocess(seqs, token_ids, is_prefill)
             if eagle3 and is_prefill:
-                self._eagle3_propose(seqs)
+                self._eagle3_propose([s for s in seqs if not s.is_finished])
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 
-    # eagle3: reserve draft KV, then run the draft head to propose next-step drafts for live seqs
-    def _eagle3_propose(self, seqs):
-        live = [s for s in seqs if not s.is_finished]
+    # eagle3: reserve draft KV, then run the draft head to build each live seq's next-step token tree
+    def _eagle3_propose(self, live):
         for s in live:
             self.scheduler.block_manager.may_append(s, self.scheduler.k)
-        for s, d in zip(live, self.model_runner.call("propose", live, self.scheduler.k)):
-            s.draft_tokens = d
+        for s, d in zip(live, self.model_runner.call("propose_tree", live)):
+            s.draft_tree_tokens = d
 
     def is_finished(self):
         return self.scheduler.is_finished()

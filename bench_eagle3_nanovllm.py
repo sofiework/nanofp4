@@ -44,24 +44,30 @@ def git_commit():
                           capture_output=True, text=True).stdout.strip() or "unknown"
 
 
+# N=7, depth-2 binary tree (root + 2 children + 4 grandchildren) for the eagle3_tree mode
+TREE_STR = "[(0,),(1,),(0,0),(0,1),(1,0),(1,1)]"
+
+
 def bench(mode, gc, ts):
-    spec = (mode == "eagle3")
-    kw = dict(enforce_eager=True, enable_mixbatch=False,
-              enable_spec=spec, num_spec_tokens=(K if spec else 0))
+    spec = mode in ("eagle3", "eagle3_tree")
+    kw = dict(enforce_eager=True, enable_spec=spec, num_spec_tokens=(K if spec else 0))
     if spec:
         kw.update(spec_method="eagle3", draft_model=DRAFT)
+    if mode == "eagle3_tree":
+        kw["speculative_token_tree"] = TREE_STR
     llm = LLM(PATH, **kw)
     tok = llm.tokenizer
 
-    # count midlayer forwards (window + single-token passes)
+    # count draft-head midlayer forwards (window pass + one re-fed pass per tree level)
     draft_fwd = {"n": 0}
     if spec:
-        orig_propose = llm.model_runner.propose
-        def counted(seqs, k):
+        depth = llm.config.spec_tree.max_depth
+        orig_propose = llm.model_runner.propose_tree
+        def counted(seqs):
             for s in seqs:
-                draft_fwd["n"] += 1 + (k - 1 if s.num_completion_tokens > 0 else 0)
-            return orig_propose(seqs, k)
-        llm.model_runner.propose = counted
+                draft_fwd["n"] += 1 + (depth if s.num_completion_tokens > 0 else 0)
+            return orig_propose(seqs)
+        llm.model_runner.propose_tree = counted
 
     rows = []
     for pid, cat, text in PROMPTS:
@@ -201,7 +207,7 @@ def main():
     ts = datetime.datetime.now().isoformat(timespec="seconds")
     env = {**os.environ, "BENCH_GC": gc, "BENCH_TS": ts}
     rows = []
-    for mode in ("vanilla", "eagle3"):
+    for mode in ("vanilla", "eagle3", "eagle3_tree"):
         out = subprocess.run([sys.executable, __file__, mode], cwd=os.path.expanduser("~/nano-vllm"),
                              env=env, capture_output=True, text=True)
         for line in out.stdout.splitlines():
@@ -216,9 +222,15 @@ def main():
     write_md(rows, gc, ts)
     print(f"wrote {len(rows)} runs -> {OUT_JSONL}")
     print(f"wrote {OUT_MD}")
-    for r in rows:
-        if r["mode"] == "eagle3":
-            print(f"  {r['run_id']:<28} tok/s={r['decode_tok_s']:<7} accept={r['avg_accept_len']} tgt_fwd={r['target_forward_count']}")
+    # chain vs tree accept-length comparison (the point of tree drafting: same output, fewer target forwards)
+    def _macc(m):
+        rs = [r["avg_accept_len"] for r in rows if r["mode"] == m and r["avg_accept_len"]]
+        return sum(rs) / len(rs) if rs else float("nan")
+    def _mtps(m):
+        rs = [r["decode_tok_s"] for r in rows if r["mode"] == m]
+        return sum(rs) / len(rs) if rs else float("nan")
+    print(f"  mean accept_len   chain={_macc('eagle3'):.3f}  tree={_macc('eagle3_tree'):.3f}")
+    print(f"  mean decode tok/s chain={_mtps('eagle3'):.1f}  tree={_mtps('eagle3_tree'):.1f}  (vanilla={_mtps('vanilla'):.1f})")
 
 
 if __name__ == "__main__":

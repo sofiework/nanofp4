@@ -6,7 +6,6 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.models.qwen3 import Qwen3MLP
-from nanovllm.utils.context import set_context
 
 
 class Eagle3Midlayer(nn.Module):
@@ -114,54 +113,4 @@ class Eagle3Proposer(nn.Module):
         self.lm_head.weight.data.copy_(sd["lm_head.weight"])
         self.d2t.copy_(sd["d2t"])               # t2d 跳过, greedy 用不到
 
-    def _sample(self, hidden: torch.Tensor) -> int:
-        # hidden [1, 2048] -> draft vocab argmax -> target vocab id
-        draft_id = self.lm_head(hidden).argmax(dim=-1)
-        return int(draft_id + self.d2t[draft_id])
-
-    @torch.inference_mode()
-    def propose(
-        self,
-        input_ids: torch.Tensor,      # [n_use] shifted window tokens
-        positions: torch.Tensor,      # [n_use]
-        features: torch.Tensor,       # [n_use, 6144] fc 前原料
-        num_draft: int,               # 0 = 只填 draft KV (非最后 prefill chunk)
-        steps: list[tuple[int, int]], # single-token pass 每步的 (slot, context_len)
-        block_tables: torch.Tensor,
-    ) -> list[int]:
-        
-        # window pass, fc projection
-        feat = self.fc(features)
-
-        # x: MLP output, residual: pre-normed
-        x, residual = self.midlayer(positions, self.embed_tokens(input_ids), feat)
-        
-        # fused add residual2 + norm
-        # hidden -> for lm head, prenorm -> next feature
-        hidden, prenorm = self.norm(x, residual)
-
-        if num_draft == 0:
-            return []
-
-        # hidden[-1].shape = [1, 2048]
-        out = [self._sample(hidden[-1:])]       # first draft token
-        feat = prenorm[-1:]                     # last token -> next feature
-
-        # k-1 次 single-token pass (decode 路径)
-        for slot, ctx_len in steps:
-            # is_prefill = False -> decode attn
-            # slot_mapping = [slot] -> KV
-            # context_lens = [ctx_len] -> KV read length
-            set_context(False,
-                        slot_mapping=torch.tensor([slot], dtype=torch.int32, device="cuda"),
-                        context_lens=torch.tensor([ctx_len], dtype=torch.int32, device="cuda"),
-                        block_tables=block_tables)
-            pos = torch.tensor([ctx_len - 1], dtype=torch.int64, device="cuda")  
-            tok = torch.tensor([out[-1]], dtype=torch.int64, device="cuda")
-
-            x, residual = self.midlayer(pos, self.embed_tokens(tok), feat)
-            hidden, feat = self.norm(x, residual)
-
-            out.append(self._sample(hidden))
-        return out
 

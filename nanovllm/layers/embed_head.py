@@ -55,8 +55,8 @@ class ParallelLMHead(VocabParallelEmbedding):
 
     def forward(self, x: torch.Tensor):
         context = get_context()
-        # prefill keeps only the last token per seq; verify keeps all (1 + m draft logits)
-        if context.is_prefill and not context.is_verify:
+        # prefill keeps only the last token per seq; verify/tree keep all (per-node logits)
+        if context.is_prefill and not context.is_verify and not context.is_tree:
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight)

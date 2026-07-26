@@ -3,6 +3,7 @@ from collections import deque
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
+from nanovllm.utils.spec_decoding.tree import walk_accept
 
 
 class Scheduler:
@@ -17,7 +18,14 @@ class Scheduler:
         self.running: deque[Sequence] = deque()
 
         # speculative decoding: reserve room for 1 + k tokens per decode step
-        self.k = config.num_spec_tokens if config.enable_spec else 0
+        # eagle3 tree: k = number of non-root tree nodes; ngram: dynamic chain of num_spec_tokens
+        self.spec_tree = config.spec_tree
+        if config.enable_spec and config.spec_method == "eagle3":
+            self.k = config.spec_tree.num_draft
+        elif config.enable_spec:
+            self.k = config.num_spec_tokens
+        else:
+            self.k = 0
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -125,6 +133,33 @@ class Scheduler:
 
             # verify wrote KV for all 1 + m tokens; only 1 + num_accepted are valid.
             # hash the committed span, then roll back num_cached_tokens to len - 1 (rejected KV is overwritten next step).
+            seq.num_scheduled_tokens = 1 + num_accepted
+            self.block_manager.hash_blocks(seq)
+            seq.num_cached_tokens = len(seq) - 1
+            seq.num_scheduled_tokens = 0
+
+    # eagle3 tree accept: walk from the root along the branch whose drafted token matches the target's
+    # argmax at each node; commit that branch + 1 bonus token, record the branch for the KV gather, roll back.
+    def postprocess_spec_tree(self, seqs: list[Sequence], decode_verify: list[list[int]]):
+        for seq, target_argmax in zip(seqs, decode_verify):
+            seq.spec_base = seq.num_cached_tokens          # root/anchor position, before append
+            path, committed = walk_accept(self.spec_tree, target_argmax, seq.draft_tree_tokens)
+            seq.accepted_path = path
+            num_accepted = len(committed) - 1
+
+            finished = False
+            for token_id in committed:
+                seq.append_token(token_id)
+                if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                    finished = True
+                    break
+
+            if finished:
+                seq.status = SequenceStatus.FINISHED
+                self.block_manager.deallocate(seq)
+                self.running.remove(seq)
+                continue
+
             seq.num_scheduled_tokens = 1 + num_accepted
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens = len(seq) - 1

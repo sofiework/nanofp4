@@ -38,10 +38,12 @@ class ModelRunner:
         self._aux: torch.Tensor | None = None
         self.aux_features: dict[int, tuple[torch.Tensor, int]] = {}
         self.proposer = None
+        self.num_target_layers = hf_config.num_hidden_layers
         if config.spec_method == "eagle3":
             self.proposer = Eagle3Proposer(self.model.model.embed_tokens)
             self.proposer.load_weights(config.draft_model)
             self.model.model.aux_layers = (1, 13, 24)
+            self._build_tree_meta(config.spec_tree)
 
         self.warmup_model()
         self.allocate_kv_cache()
@@ -305,38 +307,141 @@ class ModelRunner:
             idx += n
         return out
 
-    # eagle3: run the draft head to propose k tokens per seq (window pass fills draft KV, then k single-token passes)
+    # ---------------- tree speculative decoding (eagle3) ----------------
+
+    def _build_tree_meta(self, tree):
+        # full [N,N] verify bias + precomputed per-level (fed nodes / bias / parents / depths) for the proposer
+        self.tree = tree
+        self.tree_bias = tree.additive_bias("cuda")
+        self.level_fed, self.level_bias, self.level_parent, self.level_depth = [], [], [], []
+        for d in range(1, tree.max_depth + 1):
+            fed = [n for dd in range(1, d + 1) for n in tree.levels[dd]]
+            sub = tree.mask[fed][:, fed]
+            self.level_fed.append(fed)
+            self.level_bias.append(torch.where(sub.to("cuda"), 0.0, float("-inf")))
+            self.level_parent.append([tree.parent[n] for n in fed])
+            self.level_depth.append([tree.depth[n] for n in fed])
+
+    def _slot(self, seq: Sequence, pos: int) -> int:
+        return seq.block_table[pos // self.block_size] * self.block_size + pos % self.block_size
+
+    # feed [root, node_1..node_{N-1}] per seq; tree-masked attention keeps per-node logits
+    def prepare_verify_tree(self, seqs: list[Sequence]):
+        N = self.tree.num_nodes
+        input_ids, positions, slot_mapping, context_lens = [], [], [], []
+        for seq in seqs:
+            base = seq.num_cached_tokens            # = len(seq) - 1 (root/anchor position)
+            input_ids.extend(seq.draft_tree_tokens)  # length N, node 0 = last_token
+            positions.extend(base + self.tree.depth[i] for i in range(N))
+            slot_mapping.extend(self._slot(seq, base + i) for i in range(N))   # distinct scratch slots by flat index
+            context_lens.append(base)               # context = [0, base): committed tokens before the root
+        block_tables = self.prepare_block_tables(seqs)
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables,
+                    is_tree=True, tree_bias=self.tree_bias, tree_q_len=N)
+        return input_ids, positions
+
+    # tree verify forward: greedy argmax at every tree node
     @torch.inference_mode()
-    def propose(self, seqs: list[Sequence], k: int) -> list[list[int]]:
+    def run_verify_tree(self, seqs: list[Sequence]) -> list[list[int]]:
+        self.aux_features.clear()
+        input_ids, positions = self.prepare_verify_tree(seqs)
+        logits = self.run_model(input_ids, positions, is_prefill=True)   # eager (enforce_eager); is_tree keeps all logits
+        reset_context()
+        if self.rank != 0:
+            return []
+        N = self.tree.num_nodes
+        argmax = logits.argmax(dim=-1).tolist()
+        return [argmax[i * N:(i + 1) * N] for i in range(len(seqs))]
+
+    # after accept: move accepted target KV to contiguous committed slots + stash aux for the accepted branch
+    @torch.inference_mode()
+    def finalize_verify(self, seqs: list[Sequence]):
+        N = self.tree.num_nodes
+        src_slots, dst_slots = [], []
+        for i, seq in enumerate(seqs):
+            base = seq.spec_base
+            path = seq.accepted_path
+            if self.rank == 0 and self._aux is not None:
+                aux_seq = self._aux[i * N:(i + 1) * N]
+                self.aux_features[seq.seq_id] = (aux_seq[path], base)   # gather accepted-branch aux, in path order
+            for j, node in enumerate(path):
+                if j == 0:
+                    continue                       # root already committed at slot base
+                src, dst = self._slot(seq, base + node), self._slot(seq, base + j)
+                if src != dst:
+                    src_slots.append(src)
+                    dst_slots.append(dst)
+        if src_slots:
+            kv = self.kv_cache      # [2, L, num_blocks, block_size, num_kv_heads, head_dim]
+            flat = kv.view(kv.size(0), kv.size(1), -1, kv.size(4), kv.size(5))
+            src = torch.tensor(src_slots, dtype=torch.long, device=flat.device)
+            dst = torch.tensor(dst_slots, dtype=torch.long, device=flat.device)
+            L = self.num_target_layers
+            flat[:, :L, dst] = flat[:, :L, src].clone()
+
+    # eagle3: run the draft head to build the next step's token tree per seq
+    @torch.inference_mode()
+    def propose_tree(self, seqs: list[Sequence]) -> list[list[int]]:
+        tree, P = self.tree, self.proposer
+        N = tree.num_nodes
         drafts = []
         for seq in seqs:
             feats, start = self.aux_features.pop(seq.seq_id)
-            # feature[i] + embed(token[i+1]) -> draft token[i+2], for i = start .. start+n_use-1
+            base = seq.num_cached_tokens            # = len(seq) - 1 = start
             n_use = min(len(feats), len(seq) - 1 - start)
-            input_ids = seq[start + 1 : start + n_use + 1]
-            positions = list(range(start, start + n_use))
-            num_draft = k if seq.num_completion_tokens > 0 else 0
+            num_draft = tree.num_draft if seq.num_completion_tokens > 0 else 0
+            tokens = [0] * N
+            tokens[0] = seq.last_token
+            bt = self.prepare_block_tables([seq])
 
-            slot = lambda p: seq.block_table[p // self.block_size] * self.block_size + p % self.block_size
-            slot_mapping = [slot(p) for p in positions]
-
-            input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-            positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-            cu_seqlens_q = torch.tensor([0, n_use], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-            cu_seqlens_k = torch.tensor([0, start + n_use], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-            slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-            block_tables = self.prepare_block_tables([seq])
-
-            # window pass context (fills draft KV for the committed tokens)
-            set_context(True, cu_seqlens_q, cu_seqlens_k,
+            # window pass: normal causal prefill over the committed window; fills draft KV, seeds the root
+            w_ids = torch.tensor(seq[start + 1:start + n_use + 1], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            w_pos = torch.tensor(list(range(start, start + n_use)), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            w_slot = torch.tensor([self._slot(seq, p) for p in range(start, start + n_use)], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            set_context(True,
+                        cu_seqlens_q=torch.tensor([0, n_use], dtype=torch.int32, device="cuda"),
+                        cu_seqlens_k=torch.tensor([0, start + n_use], dtype=torch.int32, device="cuda"),
                         max_seqlen_q=n_use, max_seqlen_k=start + n_use,
-                        slot_mapping=slot_mapping, block_tables=block_tables)
-            # single-token pass steps: (slot, context_len) for each extra draft
-            steps = [(slot(p), p + 1) for p in range(len(seq) - 1, len(seq) - 1 + max(num_draft - 1, 0))]
-
-            drafts.append(self.proposer.propose(input_ids, positions,
-                                                feats[:n_use], num_draft, steps, block_tables))
+                        slot_mapping=w_slot, block_tables=bt)
+            x, residual = P.midlayer(w_pos, P.embed_tokens(w_ids), P.fc(feats[:n_use]))
+            hidden, prenorm = P.norm(x, residual)
             reset_context()
+            if num_draft == 0:
+                drafts.append(tokens)
+                continue
+
+            h = {0: hidden[-1:]}      # node -> hidden (selects its children's tokens)
+            pf = {0: prenorm[-1:]}    # node -> prenorm (feature fed into its children's forward)
+            for d in range(1, tree.max_depth + 1):
+                # assign frontier tokens from each parent's hidden (top-|children| of the draft head)
+                for p in tree.levels[d - 1]:
+                    ch = tree.children[p]
+                    if not ch:
+                        continue
+                    top = P.lm_head(h[p]).topk(len(ch), dim=-1).indices[0]
+                    for rank, c in enumerate(ch):
+                        did = int(top[rank])
+                        tokens[c] = did + int(P.d2t[did])
+                # re-feed draft nodes depths 1..d under the tree mask to get the frontier's h/pf
+                fed = self.level_fed[d - 1]
+                f_ids = torch.tensor([tokens[n] for n in fed], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+                f_pos = torch.tensor([base + dep - 1 for dep in self.level_depth[d - 1]], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+                f_slot = torch.tensor([self._slot(seq, base + n) for n in fed], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+                f_feat = torch.cat([pf[par] for par in self.level_parent[d - 1]], dim=0)
+                set_context(False, slot_mapping=f_slot,
+                            context_lens=torch.tensor([base], dtype=torch.int32, device="cuda"),
+                            block_tables=bt, is_tree=True, tree_bias=self.level_bias[d - 1], tree_q_len=len(fed))
+                fx, fres = P.midlayer(f_pos, P.embed_tokens(f_ids), f_feat)
+                fh, fpf = P.norm(fx, fres)
+                reset_context()
+                for i, n in enumerate(fed):
+                    h[n] = fh[i:i + 1]
+                    pf[n] = fpf[i:i + 1]
+            drafts.append(tokens)
         return drafts
 
     @torch.inference_mode()

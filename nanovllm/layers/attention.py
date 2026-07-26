@@ -61,6 +61,8 @@ class Attention(nn.Module):
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+        if context.is_tree:
+            return self.tree_forward(q, k, v, context)
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
@@ -70,6 +72,39 @@ class Attention(nn.Module):
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
             o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables, 
+                                        cache_seqlens=context.context_lens, block_table=context.block_tables,
                                         softmax_scale=self.scale, causal=True)
         return o
+
+    # tree-masked attention (vLLM tree_attn style): each of the N tree nodes attends to the whole
+    # committed context (paged flash, no causal) + its ancestors in the tree (in-hand masked SDPA),
+    # merged by online softmax. Query layout is [S*N] tokens, seq-major; N = context.tree_q_len.
+    def tree_forward(self, q, k, v, context):
+        N = context.tree_q_len
+        S = q.size(0) // N
+        Hq, Hkv, Dh = self.num_heads, self.num_kv_heads, self.head_dim
+        q4 = q.view(S, N, Hq, Dh)
+
+        # prefix: committed context via paged flash (causal=False -> all nodes see all context), keep the LSE
+        pre_out, pre_lse = flash_attn_with_kvcache(
+            q4, self.k_cache, self.v_cache,
+            cache_seqlens=context.context_lens, block_table=context.block_tables,
+            softmax_scale=self.scale, causal=False, return_softmax_lse=True)   # [S,N,Hq,Dh], [S,Hq,N]
+
+        # suffix: in-hand masked attention over the N tree nodes' k/v (tiny; explicit for the LSE)
+        g = Hq // Hkv
+        kt = k.view(S, N, Hkv, Dh).repeat_interleave(g, dim=2).float()   # [S,N,Hq,Dh]
+        vt = v.view(S, N, Hkv, Dh).repeat_interleave(g, dim=2).float()
+        scores = torch.einsum("snhd,smhd->shnm", q4.float(), kt) * self.scale   # [S,Hq,N,N]
+        scores = scores + context.tree_bias[None, None]
+        suf_lse = torch.logsumexp(scores, dim=-1)                              # [S,Hq,N]
+        suf_out = torch.einsum("shnm,smhd->snhd", scores.softmax(-1), vt)      # [S,N,Hq,Dh]
+
+        # merge the two disjoint key-sets (context vs tree) by online softmax
+        pre_lse = pre_lse.transpose(1, 2).float()   # [S,N,Hq]
+        suf_lse = suf_lse.transpose(1, 2).float()
+        m = torch.maximum(pre_lse, suf_lse)
+        p = torch.exp(pre_lse - m)
+        s = torch.exp(suf_lse - m)
+        o = (pre_out.float() * p[..., None] + suf_out * s[..., None]) / (p + s)[..., None]
+        return o.reshape(S * N, Hq, Dh).to(q.dtype)

@@ -2,6 +2,8 @@ import os
 from dataclasses import dataclass
 from transformers import AutoConfig
 
+from nanovllm.utils.spec_decoding.tree import build_spec_tree, SpecTree
+
 
 @dataclass(slots=True)
 class Config:
@@ -19,9 +21,11 @@ class Config:
 
     # speculative decoding
     enable_spec: bool = False
-    num_spec_tokens: int = 0       # k draft tokens per step (0 when disabled)
+    num_spec_tokens: int = 0       # k draft tokens per step (0 when disabled); chain length when no tree given
     spec_method: str = "ngram"     # "ngram" | "eagle3"
     draft_model: str = ""          # eagle3 draft-head weights path
+    speculative_token_tree: str = ""   # vLLM-style path-list literal; "" -> chain of num_spec_tokens
+    spec_tree: SpecTree | None = None  # built in __post_init__ (eagle3 only); ngram stays a dynamic chain
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -30,5 +34,6 @@ class Config:
         if self.spec_method == "eagle3":
             assert self.enable_spec, "eagle3 requires enable_spec=True"
             assert os.path.isdir(self.draft_model), "eagle3 requires draft_model path"
+            self.spec_tree = build_spec_tree(self.speculative_token_tree, self.num_spec_tokens)
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
