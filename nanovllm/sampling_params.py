@@ -7,7 +7,7 @@ class SamplingParams:
     max_tokens: int = 64
     ignore_eos: bool = False
 
-    priority: int = 0  # normal/fast mode
+    priority: int = 0  # SLO tier: 0=batch (best-effort), 1=standard, 2=premium; higher served first
 
     def __post_init__(self):
         assert self.temperature > 1e-10, "greedy sampling is not permitted"

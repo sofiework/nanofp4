@@ -1,0 +1,2 @@
+{"name": "eagle3", "util": 0.93, "mnbt": 256, "mns": 1, "plen": 512, "gen": 64, "prefill_steps": 2, "ttft_ms": 13925.3, "prefill_tok_per_s": 36.8, "decode_tok_s": 9.3, "itl_p50_ms": 209.84, "itl_p99_ms": 1347.78, "accept_len": 2.52, "total_s": 20.7}
+{"name": "eagle3", "util": 0.92, "mnbt": 256, "mns": 1, "plen": 512, "gen": 64, "prefill_steps": 2, "ttft_ms": 13866.1, "prefill_tok_per_s": 36.9, "decode_tok_s": 9.3, "itl_p50_ms": 212.29, "itl_p99_ms": 1315.95, "accept_len": 2.52, "total_s": 20.6}

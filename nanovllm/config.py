@@ -18,7 +18,8 @@ class Config:
     num_kvcache_blocks: int = -1
 
     # priority scheduling
-    priority_deadline: float = 10.0  # <= 0 disable
+    priority_deadline: float = 10.0  # aging step (s): age up one level every deadline; <= 0 disable
+    max_priority: int = 2            # top tier; priority ints 0..max_priority (higher = served first)
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

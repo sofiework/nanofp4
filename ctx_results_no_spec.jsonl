@@ -1,0 +1,3 @@
+{"name": "no_spec", "util": 0.92, "mnbt": 256, "mns": 8, "plen": 256, "gen": 32, "prefill_steps": 1, "ttft_ms": 1432.2, "prefill_tok_per_s": 178.8, "decode_tok_s": 9.94, "itl_p50_ms": 100.54, "itl_p99_ms": 105.55, "accept_len": 1.0, "total_s": 4.6}
+{"name": "no_spec", "util": 0.92, "mnbt": 256, "mns": 8, "plen": 512, "gen": 32, "prefill_steps": 1, "ttft_ms": 11040.1, "prefill_tok_per_s": 46.4, "decode_tok_s": 8.88, "itl_p50_ms": 112.62, "itl_p99_ms": 113.04, "accept_len": 1.0, "total_s": 14.5}
+{"name": "no_spec", "util": 0.92, "mnbt": 256, "mns": 8, "plen": 1024, "gen": 32, "prefill_steps": 2, "ttft_ms": 37035.2, "prefill_tok_per_s": 27.6, "decode_tok_s": 7.29, "itl_p50_ms": 137.15, "itl_p99_ms": 137.81, "accept_len": 1.0, "total_s": 41.3}

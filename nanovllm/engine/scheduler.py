@@ -19,6 +19,7 @@ class Scheduler:
 
         # priority scheduling
         self.priority_deadline = config.priority_deadline
+        self.max_priority = config.max_priority
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -27,10 +28,14 @@ class Scheduler:
         seq.arrival_time = time.monotonic()
         self.waiting.append(seq)
 
-    # effective priority: bump a normal seq to fast once it waits past the deadline (anti-starvation)
+    # effective priority (anti-starvation via aging): every priority_deadline seconds a waiting seq
+    # ages up one level, capped at max_priority. A starving batch (0) seq reaches the top tier after
+    # max_priority * deadline, so it can never be indefinitely blocked by higher tiers. deadline <= 0
+    # disables aging (pure static priority). Generalizes the old 2-level max(priority, 1) bump.
     def _priority(self, seq: Sequence, now: float) -> int:
-        if self.priority_deadline > 0 and now - seq.arrival_time > self.priority_deadline:
-            return max(seq.priority, 1)
+        if self.priority_deadline > 0:
+            steps = int((now - seq.arrival_time) // self.priority_deadline)
+            return min(seq.priority + steps, self.max_priority)
         return seq.priority
 
     # pick the next waiting seq: started (mid-chunk) first, then priority, then earliest arrival
