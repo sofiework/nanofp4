@@ -1,0 +1,40 @@
+{
+  "no_spec": [
+    {
+      "pid": "code",
+      "gen": 512,
+      "throughput_tok_s": 10.34,
+      "ttft_ms": 1106.27,
+      "itl_p50_ms": 100.52,
+      "itl_p99_ms": 112.73,
+      "accept_len": 1.0
+    },
+    {
+      "pid": "qa",
+      "gen": 512,
+      "throughput_tok_s": 10.35,
+      "ttft_ms": 210.75,
+      "itl_p50_ms": 100.62,
+      "itl_p99_ms": 112.78,
+      "accept_len": 1.0
+    },
+    {
+      "pid": "math",
+      "gen": 512,
+      "throughput_tok_s": 10.27,
+      "ttft_ms": 277.21,
+      "itl_p50_ms": 101.02,
+      "itl_p99_ms": 113.75,
+      "accept_len": 1.0
+    },
+    {
+      "pid": "story",
+      "gen": 512,
+      "throughput_tok_s": 10.3,
+      "ttft_ms": 232.15,
+      "itl_p50_ms": 100.99,
+      "itl_p99_ms": 113.07,
+      "accept_len": 1.0
+    }
+  ]
+}

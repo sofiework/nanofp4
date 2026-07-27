@@ -181,12 +181,23 @@ def nvfp4_linear(x: torch.Tensor, w_packed: torch.Tensor, w_scale: torch.Tensor,
     xh = x if x.dtype in (torch.float16, torch.bfloat16) else x.to(torch.float16)
     x2d = xh.reshape(-1, xh.shape[-1])
     M, K = x2d.shape
-    N = w_packed.shape[0]
-    assert w_packed.shape[1] * 2 == K, f"packed {w_packed.shape} vs K={K}"
     scale_fp8 = w_scale.dtype == torch.float8_e4m3fn
     # Triton can't reinterpret a passed-in pointer's element type, so view the fp8 scale as uint8 here and
     # bitcast in-kernel. (fp8 is 1 byte -> same shape/strides.) fp16 scale is passed through unchanged.
     s_arg = w_scale.view(torch.uint8) if scale_fp8 else w_scale
+    # Two weight layouts, auto-detected by which dim is K/2:
+    #   legacy [N, K/2]  -> the kernel reads the N dim with stride K/2 (uncoalesced; fine for prefill).
+    #   relaid  [K/2, N] -> N is contiguous (stride 1) so the M=1 decode GEMV weight read COALESCES
+    #                       (see relayout_nvfp4_weights). Same kernels, just swapped B/scale strides.
+    if w_packed.shape[1] * 2 == K:                       # [N, K/2]
+        N = w_packed.shape[0]
+        bn, bk = w_packed.stride(0), w_packed.stride(1)
+        sn, sk = s_arg.stride(0), s_arg.stride(1)
+    else:                                                # [K/2, N] (N-contiguous)
+        assert w_packed.shape[0] * 2 == K, f"packed {tuple(w_packed.shape)} vs K={K}"
+        N = w_packed.shape[1]
+        bn, bk = w_packed.stride(1), w_packed.stride(0)
+        sn, sk = s_arg.stride(1), s_arg.stride(0)
     if M <= _GEMV_MAX_M:
         # split-K path: fp32 accumulator (atomic-add of SPLIT_K partials), zero-initialized.
         c32 = torch.zeros((M, N), device=x.device, dtype=torch.float32)
@@ -194,8 +205,8 @@ def nvfp4_linear(x: torch.Tensor, w_packed: torch.Tensor, w_scale: torch.Tensor,
         grid = (triton.cdiv(M, bm) * triton.cdiv(N, _GEMV_BLOCK_N) * _GEMV_SPLIT_K,)
         _nvfp4_gemv_kernel[grid](
             x2d, w_packed, s_arg, w_scale_2, c32, M, N, K,
-            x2d.stride(0), x2d.stride(1), w_packed.stride(0), w_packed.stride(1),
-            s_arg.stride(0), s_arg.stride(1), c32.stride(0), c32.stride(1),
+            x2d.stride(0), x2d.stride(1), bn, bk,
+            sn, sk, c32.stride(0), c32.stride(1),
             GROUP_SIZE=group_size, BLOCK_M=bm, BLOCK_N=_GEMV_BLOCK_N, BLOCK_K=_GEMV_BLOCK_K,
             SPLIT_K=_GEMV_SPLIT_K, SCALE_FP8=scale_fp8, num_warps=4, num_stages=3,
         )
@@ -206,14 +217,32 @@ def nvfp4_linear(x: torch.Tensor, w_packed: torch.Tensor, w_scale: torch.Tensor,
         grid = (triton.cdiv(M, cfg["BLOCK_M"]) * triton.cdiv(N, cfg["BLOCK_N"]),)
         _nvfp4_gemm_kernel[grid](
             x2d, w_packed, s_arg, w_scale_2, c, M, N, K,
-            x2d.stride(0), x2d.stride(1), w_packed.stride(0), w_packed.stride(1),
-            s_arg.stride(0), s_arg.stride(1), c.stride(0), c.stride(1),
+            x2d.stride(0), x2d.stride(1), bn, bk,
+            sn, sk, c.stride(0), c.stride(1),
             GROUP_SIZE=group_size, BLOCK_M=cfg["BLOCK_M"], BLOCK_N=cfg["BLOCK_N"], BLOCK_K=cfg["BLOCK_K"],
             SCALE_FP8=scale_fp8, num_warps=cfg["num_warps"], num_stages=cfg["num_stages"],
         )
     if bias is not None:
         c = c + bias.to(c.dtype)
     return c.to(out_dtype).view(*x.shape[:-1], N)
+
+
+@torch.no_grad()
+def relayout_nvfp4_weights(model) -> int:
+    """One-time post-load re-layout: transpose each NVFP4 linear's packed weight [N, K/2] -> [K/2, N]
+    and block scale [N, K/G] -> [K/G, N] so the N dim is contiguous. This makes the M=1 decode GEMV
+    weight read COALESCED (nsys: the [N, K/2] layout reads N with stride K/2 -> ~215 GB/s / 21% of peak;
+    the biggest decode cost). nvfp4_linear auto-detects the layout, so kernels are unchanged. Loaders
+    (which shard [N, K/2]) are untouched — the transpose happens after all weights are resident.
+    Returns the number of relaid-out linears."""
+    n = 0
+    for m in model.modules():
+        w = getattr(m, "weight", None)
+        if getattr(m, "nvfp4", False) and w is not None and w.dtype == torch.uint8:
+            m.weight.data = w.data.t().contiguous()               # [K/2, N]
+            m.weight_scale.data = m.weight_scale.data.t().contiguous()   # [K/G, N]
+            n += 1
+    return n
 
 
 @torch.no_grad()

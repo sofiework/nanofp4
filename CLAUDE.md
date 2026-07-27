@@ -110,6 +110,53 @@
     (3) 但 draft head_dim=80 non-pow2 -> triton tl.arange 要求 pow2 -> fp4 store/read kernel 崩。
         修复: head_dim 维度 pad 到 next_pow2 (NB_POW2 / D_POW2) + mask (head_dim=128 时 no-op 无 regression)。
         head_dim 80/128 store+read roundtrip vs torch ref rel~2.5e-3; 1.7B eagle3 accept 1.51 无 regression
+  - 4090 VRAM/context/permutation study (2026-07-24, 详见 fp4_4090_vram_analysis.md + .jsonl):
+    - weights 19.26G (packed 14.53 + fp8 scale 1.82 + embed 1.45 + **lm_head 1.45**; tie=False 两份 bf16,
+      不是 bring-up log 说的 1.5G tied)。eagle3 head 额外 +1.57G -> 20.83G
+    - fp4 KV = 24MiB/block = 96KB/token (64KB data + **32KB fp32 scale**, scale 占 1/3 = 头号 squeeze)
+    - **no_spec** max ctx: util0.94 -> 83 blocks ≈ 21k tok (free 43MB, fragile); 安全 util0.92 -> 63 blk ≈ 16k
+    - **eagle3 现在几乎不可用**: eager (无 graph) -> util 越高 KV 越大 runtime headroom 越少 -> OOM。
+      只有 util≤0.93 能跑真 prefill (u0.94 tiny gen 过但 512 prefill OOM); 可用 ctx ~3k。
+      expandable_segments 救不了
+    - **prefill 是实际瓶颈不是 VRAM**: 2048-tok prefill 184s (super-linear O(N²))。根因 = fp4-KV
+      dequant-in-loop paged read kernel (prefill+decode-at-ctx 都慢), **不是 weight GEMM**
+      (decode GEMM fp16 parity; prefill GEMM 只 3-5x 占 prefill <5%)
+    - eagle3 accept_len **2.52** (k=2 健康) 但 e2e 只 ~1.05x (eager 210ms/fwd 抵消 accept 增益 vs graphed
+      no_spec 100ms)
+    - 下一步 permutation 优先级: (1) fp4 KV scale fp32->fp8 (KV -25% + 加速 paged read, 双赢)
+      (2) 优化 fp4-KV paged read kernel (95% prefill 成本) (3) quant eagle3 head + tie/quant lm_head 省 ~2.5G
+      (4) eagle3 可 capture (graph) 才能兑现 accept 2.52 (5) fp8-TC prefill
+  - kernel optimization round 2 (2026-07-25, spec 先禁用, 只做 no_spec; 详见 fp4_4090_vram_analysis.md §7):
+    - nsys 定位: single-chunk prefill = nvfp4 GEMM 96.8%; chunked prefill (mnbt=256 真实配置) =
+      _paged_attn_kernel **95.8% (46s/1024tok, 241ms/layer-launch)**。三缺陷: LUT gather / grid(Nq,H) 每
+      query row 重复 dequant (O(N²)) / decode 无 split-KV。(ncu 被 counter perm 挡, 用 nsys+静态分析)
+    - 改动 (Claude 代写, 全部本地 sm_89 验过 correctness):
+      (1) fp8 KV scale (config.kv_scale_fp8): fp4 per-16 scale fp32->fp8_e4m3, KV 25.17->18.87MB/block
+          (-25%), +33% blocks。store/read kernel uint8-view bitcast。fp32 path byte-exact 无 regression
+      (2) 新 tiled prefill kernel _paged_attn_tiled_kernel: BLOCK_M=32 query tile + BLOCK_N=64 + arithmetic
+          E2M1 decode + tl.dot, 每 KV tile dequant 一次跨 query 复用。vs SDPA max 4e-3, vs per-row fp4 mean 9e-6
+      (3) split-KV decode _paged_attn_splitkv_kernel (flash-decoding): bit-exact 但 **bs=1 不划算** (64 head
+          已占半 SM, merge+空 split 开销 > 收益), 默认关 (NANO_DECODE_SPLIT=1), 留给 batched/长 ctx
+    - 结果 (no_spec, util 0.90, fp8 scale, graph): **prefill TTFT 512/1024/2048/4096 = 589/1223/2611/7533ms
+      = 19x/30x/71x/~100x** vs baseline (11040/37035/184322ms)。prefill ~800 tok/s 近 O(N)。decode 7.2/5.6/
+      3.9/2.4 tok/s (memory-bound 随 ctx 降)。real prompt coherent。permutation: fp8 scale 每档 util +33% ctx
+      (util 0.90 -> 57 blocks 14.6k tok, graph OK; 更高 util graph headroom 紧, enforce_eager 可推)
+    - 推荐 no_spec config: weight nvfp4 + weight_scale_fp8 + kv fp4 + kv_scale_fp8 + util 0.90 + mnbt 256
+      + graph -> 14.6k ctx, 800 tok/s prefill
+  - decode optimization (2026-07-25, PR branch kernel-opt-fp4-decode, spec 仍禁用):
+    - nsys decode 分解 (ctx=512): _nvfp4_gemv_kernel 51.7% + _paged_attn_kernel 45.7% (各半)。graph vs
+      eager 140 vs 154ms 约等 -> 非 launch-bound 是真 GPU work。两个都是 **memory-layout coalescing** 问题
+      (不是 arithmetic decode): (1) GEMV 读 packed weight [N,K/2] 的 N 维 stride=K/2 uncoalesced -> 215 GB/s
+      (21% peak, fp16 parity); (2) paged attn token-major KV 读单 head stride=KVH*dim + bs=1 只 64 program
+      latency-starved (split-KV 不救, 是 layout 非 occupancy)
+    - 修复 (Claude 代写, 4090 验过): (a) per-row decode kernel num_warps 4->8 (latency hiding);
+      (b) **weight relayout [N,K/2]->[K/2,N]** (relayout_nvfp4_weights, load 后一次性 transpose, N 变
+      contiguous -> GEMV 读 coalesce; nvfp4_linear auto-detect layout, kernel+loader 不改)。correctness:
+      relaid vs legacy vs dequant-matmul <=2e-3, 全模型输出 byte-identical
+    - 结果 (util 0.90, fp8 scale, graph): **decode 512/1024/2048 = 16.6/14.5/11.5 tok/s** (baseline 7.1/6/3.9,
+      2.3-3x, **超过 AdaLLM 13.6**)。relayout 连带 prefill 0.87->1.4k tok/s @512。
+    - 残留: paged attn 仍占 decode ~35% (token-major KV); head-major KV layout [block,head,token,dim] 可再
+      coalesce -> 下一个 layout lever
 
 ## priority scheduling design (user-decided)
 - scenario: 交互式 fast vs 批处理 normal, 用户可选 fast/normal mode (tiered)
