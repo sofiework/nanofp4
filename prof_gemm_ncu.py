@@ -10,6 +10,8 @@ M, K, N = 512, 5120, 2 * 25600            # gate_up: the biggest prefill GEMM
 w = (torch.randn(N, K, device="cuda", dtype=torch.float16) * 0.1)
 packed, scale = quantize_nvfp4(w, G)
 packed = packed.cuda(); scale = scale.cuda().to(torch.float8_e4m3fn)
+# relaid [K/2, N] layout — this is what the real model runs (relayout_nvfp4_weights at load).
+packed = packed.t().contiguous(); scale = scale.t().contiguous()
 s2 = torch.ones(N, device="cuda", dtype=torch.float32)
 x = torch.randn(M, K, device="cuda", dtype=torch.float16)
 

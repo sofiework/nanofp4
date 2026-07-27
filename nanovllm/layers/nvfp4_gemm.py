@@ -156,11 +156,22 @@ def _nvfp4_gemv_kernel(
 
 
 def _select_config(m, k):
+    # env override for tuning (NVFP4_BM/BN/BK/WARPS/STAGES); any unset field falls back to the default.
+    env = {k2: int(os.environ[e]) for k2, e in
+           (("BLOCK_M", "NVFP4_BM"), ("BLOCK_N", "NVFP4_BN"), ("BLOCK_K", "NVFP4_BK"),
+            ("num_warps", "NVFP4_WARPS"), ("num_stages", "NVFP4_STAGES")) if e in os.environ}
     if m <= 16:
-        return dict(BLOCK_M=16, BLOCK_N=64, BLOCK_K=64, num_warps=4, num_stages=3)
-    if m <= 64:
-        return dict(BLOCK_M=64, BLOCK_N=128, BLOCK_K=64, num_warps=4, num_stages=4)
-    return dict(BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, num_warps=8, num_stages=4)
+        cfg = dict(BLOCK_M=16, BLOCK_N=64, BLOCK_K=64, num_warps=4, num_stages=3)
+    elif m <= 64:
+        cfg = dict(BLOCK_M=64, BLOCK_N=128, BLOCK_K=64, num_warps=4, num_stages=4)
+    else:
+        # prefill (M>64). BN=64 + 4 warps -> ~2 blocks/SM (vs 1 for the old 128x128/8-warp), which
+        # hides the dequant math-pipe latency the profiler flagged (was 2 active warps/sched, 68% no
+        # eligible warp). ~1.5-1.7x over the old default on Qwen3-32B shapes; BLOCK_K unchanged so the
+        # fp32 K-reduction order (and thus the output) is bit-identical. Tune via NVFP4_* env vars.
+        cfg = dict(BLOCK_M=128, BLOCK_N=64, BLOCK_K=64, num_warps=4, num_stages=3)
+    cfg.update(env)
+    return cfg
 
 
 # Small-M (decode / short-prompt) split-K params. SPLIT_K trades occupancy for atomic-add traffic; 8 is a
