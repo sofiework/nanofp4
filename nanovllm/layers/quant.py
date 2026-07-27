@@ -14,6 +14,11 @@ class QuantConfig:
     enabled: bool = False
     group_size: int = 16
     scale_fp8: bool = False
+    # activation dtype at the nvfp4 GEMM input. "" -> fp16 (W4A16, default). "fp8_fake" -> per-token
+    # fp8_e4m3 quant->dequant fake-quant, injecting exactly the W4A8 activation rounding error while the
+    # matmul math stays fp16 (a MEASUREMENT hook for the precision study; no speedup). "fp8" -> real
+    # fp8-tensor-core W4A8 path (Phase 2). Flipped at runtime to toggle A16 vs A8 on one loaded model.
+    act_mode: str = ""
 
 
 _QUANT = QuantConfig()
@@ -27,3 +32,9 @@ def set_weight_quant(enabled: bool, group_size: int = 16, scale_fp8: bool = Fals
     _QUANT.enabled = enabled
     _QUANT.group_size = group_size
     _QUANT.scale_fp8 = scale_fp8
+
+
+def set_act_mode(mode: str) -> None:
+    """"" (W4A16) | "fp8_fake" (fake-quant precision hook) | "fp8" (real W4A8 tensor-core path)."""
+    assert mode in ("", "fp8_fake", "fp8")
+    _QUANT.act_mode = mode

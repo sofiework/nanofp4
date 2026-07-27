@@ -42,6 +42,21 @@ def fake_quant_kv(x: torch.Tensor, fmt: str, scale_fp8: bool = False) -> torch.T
 
 
 @torch.no_grad()
+def fake_quant_act_fp8(x: torch.Tensor) -> torch.Tensor:
+    """Per-token (per last-dim row) fp8_e4m3 quant->dequant of an activation tensor x = [..., K].
+
+    Injects exactly the rounding error a real W4A8 fp8-activation path would read, so logits/accuracy
+    are numerically equivalent to real fp8 activations. MEASUREMENT hook only: keeps the physical dtype
+    (fp16/bf16) and the GEMM stays fp16, so it saves no memory and is NOT a speed signal. Dynamic
+    per-token scale = amax(|x|)/448 matches the standard W8A8/A8 activation quantizer.
+    """
+    xf = x.float()
+    scale = (xf.abs().amax(dim=-1, keepdim=True) / _E4M3_MAX).clamp_min(1e-12)
+    q = (xf / scale).to(torch.float8_e4m3fn).float()
+    return (q * scale).to(x.dtype)
+
+
+@torch.no_grad()
 def fake_quant_nvfp4_weight(w: torch.Tensor, block: int = 16) -> torch.Tensor:
     """NVFP4 weight fake-quant of a linear weight w = [out, in]: E2M1 4-bit elements, per-`block`
     (16) group along the in-dim, with an fp8 (e4m3) block scale — matches AngelSlim / compressed-tensors

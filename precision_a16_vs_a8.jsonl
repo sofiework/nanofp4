@@ -1,0 +1,99 @@
+{
+  "summary": {
+    "model": "Qwen3-32B_nvfp4",
+    "n_prompts": 12,
+    "tokens_per_prompt": 32,
+    "comparable_positions": 357,
+    "all_positions": {
+      "top1_agree": 0.994398,
+      "top5_overlap": 0.962465,
+      "cos": 0.997303,
+      "rel_l2": 0.066836,
+      "kl": 0.001309,
+      "max_abs": 0.959362
+    },
+    "prefill_only": {
+      "top1_agree": 1,
+      "top5_overlap": 0.933333,
+      "cos": 0.992464,
+      "rel_l2": 0.120345,
+      "kl": 0.0
+    },
+    "mean_tokens_match": 0.932292,
+    "n_prompts_no_divergence": 10
+  },
+  "per_prompt": [
+    {
+      "prompt": "Write a Python function that merges two sorted l",
+      "gen_len": 32,
+      "first_divergence": null,
+      "tokens_match": 1.0
+    },
+    {
+      "prompt": "Explain how a transformer attention mechanism wo",
+      "gen_len": 32,
+      "first_divergence": null,
+      "tokens_match": 1.0
+    },
+    {
+      "prompt": "A train travels 60 km in 45 minutes. What is its",
+      "gen_len": 32,
+      "first_divergence": null,
+      "tokens_match": 1.0
+    },
+    {
+      "prompt": "Write a short story about a lighthouse keeper wh",
+      "gen_len": 32,
+      "first_divergence": null,
+      "tokens_match": 1.0
+    },
+    {
+      "prompt": "What are the main causes of the French Revolutio",
+      "gen_len": 32,
+      "first_divergence": null,
+      "tokens_match": 1.0
+    },
+    {
+      "prompt": "Implement binary search in C and explain its tim",
+      "gen_len": 32,
+      "first_divergence": null,
+      "tokens_match": 1.0
+    },
+    {
+      "prompt": "Summarize the plot of Romeo and Juliet in three ",
+      "gen_len": 32,
+      "first_divergence": 28,
+      "tokens_match": 0.96875
+    },
+    {
+      "prompt": "Describe the process of photosynthesis at the mo",
+      "gen_len": 32,
+      "first_divergence": null,
+      "tokens_match": 1.0
+    },
+    {
+      "prompt": "What is the difference between TCP and UDP? Give",
+      "gen_len": 32,
+      "first_divergence": null,
+      "tokens_match": 1.0
+    },
+    {
+      "prompt": "Prove that the square root of 2 is irrational.",
+      "gen_len": 32,
+      "first_divergence": null,
+      "tokens_match": 1.0
+    },
+    {
+      "prompt": "Translate 'The weather is beautiful today' into ",
+      "gen_len": 32,
+      "first_divergence": 7,
+      "tokens_match": 0.21875
+    },
+    {
+      "prompt": "List five strategies for reducing carbon emissio",
+      "gen_len": 32,
+      "first_divergence": null,
+      "tokens_match": 1.0
+    }
+  ]
+}

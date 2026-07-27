@@ -5,6 +5,7 @@ import torch.distributed as dist
 
 from nanovllm.layers.quant import get_quant_config
 from nanovllm.layers.nvfp4_gemm import nvfp4_linear
+from nanovllm.utils.kv_quant import fake_quant_act_fp8
 
 
 def divide(numerator, denominator):
@@ -57,7 +58,14 @@ class LinearBase(nn.Module):
 
     def _apply(self, x: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
         if self.nvfp4:
-            return nvfp4_linear(x, self.weight, self.weight_scale, self.weight_scale_2, bias, self.group_size)
+            # activation quant (W4A8). "fp8_fake": inject fp8 activation rounding error, GEMM stays fp16
+            # (precision measurement). "fp8": real fp8-tensor-core path (handled inside nvfp4_linear).
+            act_mode = get_quant_config().act_mode
+            if act_mode == "fp8_fake":
+                x = fake_quant_act_fp8(x)
+            # act_mode == "fp8" (real fp8-tensor-core W4A8) is handled inside nvfp4_linear (Phase 2).
+            return nvfp4_linear(x, self.weight, self.weight_scale, self.weight_scale_2, bias,
+                                self.group_size)
         return F.linear(x, self.weight, bias)
 
 
