@@ -139,11 +139,19 @@ def _check(reqs):
         assert r["output_len"] == MAX_TOKENS, r
 
 
-def _worker(runs, prompts, cls, reps, mixbatch, out_path):
-    """One process, model loaded once; each run mutates priority_deadline + the SamplingParams list."""
+def _build_llm(mixbatch):
     from nanovllm import LLM
     llm = LLM(MODEL_PATH, enforce_eager=False, max_model_len=MAX_MODEL_LEN,
               max_num_batched_tokens=CHUNK, max_num_seqs=MAX_NUM_SEQS, enable_mixbatch=mixbatch)
+    nb = llm.model_runner.config.num_kvcache_blocks
+    print(f"KV cache: {nb} blocks x {llm.scheduler.block_size} = {nb * llm.scheduler.block_size} tokens",
+          flush=True)
+    return llm
+
+
+def _worker(runs, prompts, cls, reps, mixbatch, out_path):
+    """One process, model loaded once; each run mutates priority_deadline + the SamplingParams list."""
+    llm = _build_llm(mixbatch)
     llm.collect_metrics = False
     llm.generate(prompts[:32], _sp_for("baseline", cls[:32]), use_tqdm=False)   # warm-up (discarded)
 
@@ -167,10 +175,8 @@ def _worker(runs, prompts, cls, reps, mixbatch, out_path):
 
 def probe(mixbatch):
     """Closed-loop drain rate: all requests at t=0, one generate call -> lambda_sat reference."""
-    from nanovllm import LLM
     prompts, cls = gen_prompts(), gen_class(N_REQ)
-    llm = LLM(MODEL_PATH, enforce_eager=False, max_model_len=MAX_MODEL_LEN,
-              max_num_batched_tokens=CHUNK, max_num_seqs=MAX_NUM_SEQS, enable_mixbatch=mixbatch)
+    llm = _build_llm(mixbatch)
     llm.generate(prompts[:32], _sp_for("baseline", cls[:32]), use_tqdm=False)
     llm.scheduler.block_manager.reset_cache()
     t = time.perf_counter()
