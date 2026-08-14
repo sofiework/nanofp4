@@ -222,7 +222,7 @@ def _latency(run, cls, want):
 def _internals(run):
     """Per-iteration scheduler internals + throughput, pooled over reps."""
     run_, wait, bseq, btok, kv, dts = [], [], [], [], [], []
-    npre = ntok = niter = 0
+    npre = ntok = niter = nmix = npf = 0
     wall = 0.0
     slopes = []
     for rep in run["reps"]:
@@ -231,6 +231,8 @@ def _internals(run):
         ntok += sum(r["output_len"] for r in rep["reqs"])
         npre += its[-1]["preempt_cum"] if its else 0
         niter += len(its)
+        npf += sum(1 for it in its if it["n_prefill_seqs"])
+        nmix += sum(1 for it in its if it["n_prefill_seqs"] and it["n_decode_seqs"])
         for it in its:
             run_.append(it["running"])
             wait.append(it["waiting"])
@@ -246,7 +248,10 @@ def _internals(run):
         "running_mean": sum(run_) / max(len(run_), 1), "running_p95": _pct(run_, 95),
         "waiting_mean": sum(wait) / max(len(wait), 1), "waiting_p95": _pct(wait, 95),
         "batch_seqs_mean": sum(bseq) / max(len(bseq), 1), "batch_seqs_p95": _pct(bseq, 95),
-        "batch_tok_mean": sum(btok) / max(len(btok), 1), "batch_tok_p95": _pct(btok, 95),
+        # prefill iterations are rare but huge, so the token distribution is long-tailed: p99, not p95
+        "batch_tok_mean": sum(btok) / max(len(btok), 1), "batch_tok_p99": _pct(btok, 99),
+        # share of prefill iterations that also carried decode work = how often mixbatch actually fires
+        "mix_iters_pct": 100.0 * nmix / max(npf, 1),
         "kv_util_mean": sum(kv) / max(len(kv), 1), "kv_util_max": max(kv) if kv else 0.0,
         "preempt_per_1k_iters": 1000.0 * npre / max(niter, 1),
         "blocked": sum(rep.get("blocked", 0) for rep in run["reps"]),
@@ -303,17 +308,17 @@ def compare(raw_path, out_prefix):
                  f"{r['e2e_p99']:.0f} | {r['preempted_pct']:.1f} |")
 
     L += ["", "## Scheduler internals (per iteration)", "",
-          "| rate | scheduler | D | out tok/s | iters | step p50 ms | running mean/p95 | "
-          "waiting mean/p95 | batch seqs mean/p95 | batch tok mean/p95 | KV util mean/max % | "
+          "| rate | scheduler | D | out tok/s | iters | prefill it w/ decode % | step p50 ms | running mean/p95 | "
+          "waiting mean/p95 | batch seqs mean/p95 | batch tok mean/p99 | KV util mean/max % | "
           "preempt /1k it | blocked | queue slope req/s |",
-          "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+          "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in internals:
         L.append(f"| {r['rate']} | {r['scheduler']} | {r['deadline']} | {r['throughput']:.0f} | "
-                 f"{r['iters']} | {r['step_ms_p50']:.1f} | "
+                 f"{r['iters']} | {r['mix_iters_pct']:.1f} | {r['step_ms_p50']:.1f} | "
                  f"{r['running_mean']:.1f}/{r['running_p95']:.0f} | "
                  f"{r['waiting_mean']:.1f}/{r['waiting_p95']:.0f} | "
                  f"{r['batch_seqs_mean']:.1f}/{r['batch_seqs_p95']:.0f} | "
-                 f"{r['batch_tok_mean']:.0f}/{r['batch_tok_p95']:.0f} | "
+                 f"{r['batch_tok_mean']:.0f}/{r['batch_tok_p99']:.0f} | "
                  f"{r['kv_util_mean']:.0f}/{r['kv_util_max']:.0f} | "
                  f"{r['preempt_per_1k_iters']:.2f} | {r['blocked']} | {r['queue_slope']:+.2f} |")
 
