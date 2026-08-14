@@ -55,6 +55,16 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
+    # drop the prefix cache while keeping allocation state intact. A benchmark replays the same
+    # prompt set once per arm; without this, every run after the first prefills only the tail of
+    # each prompt (blocks freed by a finished seq stay hash-resident and get resurrected).
+    def reset_cache(self):
+        assert not self.used_block_ids, "reset_cache requires an idle engine"
+        self.hash_to_block_id.clear()
+        for block in self.blocks:
+            block.hash = -1
+            block.token_ids = []
+
     def can_allocate(self, seq: Sequence) -> int:
         h = -1
         num_cached_blocks = 0

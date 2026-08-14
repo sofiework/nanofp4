@@ -123,6 +123,9 @@ def _run_once(llm, prompts, sp, arrivals):
             "num_preemptions": r["num_preemptions"],
         })
     _check(reqs)
+    prefill_tok = sum(it["n_prefill_tokens"] for it in llm.iter_log)
+    want = sum(r["input_len"] for r in reqs)   # >= (not ==): a preempted seq re-prefills
+    assert prefill_tok >= 0.95 * want, f"prefilled {prefill_tok} of {want} prompt tokens: stale prefix cache?"
     iters = [{**it, "t": it["t"] - t0} for it in llm.iter_log]
     return {"wall": wall, "reqs": reqs, "iters": iters,
             "blocked": llm.scheduler.total_blocked_admissions}
@@ -151,6 +154,7 @@ def _worker(runs, prompts, cls, reps, mixbatch, out_path):
         arrivals = gen_arrivals(len(prompts), run["rate"])
         reps_data = []
         for r in range(reps):
+            llm.scheduler.block_manager.reset_cache()   # cold prefix cache: same prefill work every arm
             rep = _run_once(llm, prompts, sp, arrivals)
             print(f"  [{run['tag']}] rep {r}: wall {rep['wall']:.1f}s  iters {len(rep['iters'])}",
                   flush=True)
@@ -168,6 +172,7 @@ def probe(mixbatch):
     llm = LLM(MODEL_PATH, enforce_eager=False, max_model_len=MAX_MODEL_LEN,
               max_num_batched_tokens=CHUNK, max_num_seqs=MAX_NUM_SEQS, enable_mixbatch=mixbatch)
     llm.generate(prompts[:32], _sp_for("baseline", cls[:32]), use_tqdm=False)
+    llm.scheduler.block_manager.reset_cache()
     t = time.perf_counter()
     llm.generate(prompts, _sp_for("baseline", cls), use_tqdm=False)
     wall = time.perf_counter() - t
