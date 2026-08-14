@@ -193,3 +193,6 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+# benchmark raw traces (tens of MB, regenerate with bench_sched_sim.py)
+sched_sim_raw.json
+sched_dsweep_raw.json
