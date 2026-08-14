@@ -17,15 +17,22 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
+        # mix batch
+        self.enable_mixbatch = config.enable_mixbatch
+
         # priority scheduling
         self.priority_deadline = config.priority_deadline
         self.max_priority = config.max_priority
+
+        # scheduler-internals counters (read per iteration by the benchmark)
+        self.total_preemptions = 0
+        self.total_blocked_admissions = 0
 
     def is_finished(self):
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
-        seq.arrival_time = time.monotonic()
+        seq.arrival_time = time.perf_counter()
         self.waiting.append(seq)
 
     # effective priority (anti-starvation via aging): every priority_deadline seconds a waiting seq
@@ -49,44 +56,25 @@ class Scheduler:
                 best, best_key = seq, key
         return best
 
-    def schedule(self) -> tuple[list[Sequence], bool]:
-        scheduled_seqs = []
-        num_batched_tokens = 0
-        now = time.monotonic()
+    def schedule(self) -> tuple[list[Sequence], list[Sequence]]:
+        # iteration-level scheduling: return prefill / decode seqs separately,
+        # model_runner runs one forward each (decode via cuda graph, prefill via varlen).
+        if self.enable_mixbatch:
+            # decode first (cheap, 1 token/seq), then fill the batch with prefill
+            decode_seqs, budget = self._schedule_decode()
+            prefill_seqs = self._schedule_prefill(budget)
+        else:
+            # off: prefill-first, decode only when nothing to prefill (original behavior)
+            prefill_seqs = self._schedule_prefill()
+            decode_seqs = [] if prefill_seqs else self._schedule_decode()[0]
+        assert prefill_seqs or decode_seqs
+        return prefill_seqs, decode_seqs
 
-        # prefill
-        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self._pick_waiting(now, scheduled_seqs)
-            if seq is None:
-                break
-            remaining = self.max_num_batched_tokens - num_batched_tokens
-            if remaining == 0:
-                break
-            if not seq.block_table:
-                num_cached_blocks = self.block_manager.can_allocate(seq)
-                if num_cached_blocks == -1:
-                    break
-                num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
-            else:
-                num_tokens = seq.num_tokens - seq.num_cached_tokens
-            if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
-                break
-            if not seq.block_table:
-                self.block_manager.allocate(seq, num_cached_blocks)
-            seq.num_scheduled_tokens = min(num_tokens, remaining)
-            num_batched_tokens += seq.num_scheduled_tokens
-            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
-                seq.status = SequenceStatus.RUNNING
-                self.waiting.remove(seq)
-                self.running.append(seq)
-            scheduled_seqs.append(seq)
-
-        if scheduled_seqs:
-            return scheduled_seqs, True
-
-        # decode
-        while self.running and len(scheduled_seqs) < self.max_num_seqs:
+    def _schedule_decode(self, num_batched_tokens: int = 0) -> tuple[list[Sequence], int]:
+        decode_seqs = []
+        while self.running and len(decode_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
+            # need a new block but none free -> preempt LRU (or self, then stop)
             while not self.block_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
@@ -97,26 +85,68 @@ class Scheduler:
                 seq.num_scheduled_tokens = 1
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
-                scheduled_seqs.append(seq)
-        assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, False
+                decode_seqs.append(seq)
+                num_batched_tokens += 1
+        self.running.extendleft(reversed(decode_seqs))
+        return decode_seqs, num_batched_tokens
+
+    def _schedule_prefill(self, num_batched_tokens: int = 0) -> list[Sequence]:
+        prefill_seqs = []
+        now = time.perf_counter()
+        while self.waiting and len(prefill_seqs) < self.max_num_seqs:
+            seq = self._pick_waiting(now, prefill_seqs)
+            if seq is None:
+                break
+            remaining = self.max_num_batched_tokens - num_batched_tokens
+            if remaining <= 0:
+                break
+            if not seq.block_table:
+                num_cached_blocks = self.block_manager.can_allocate(seq)
+                if num_cached_blocks == -1:  # blocked by KV, not by the seq/token caps
+                    self.total_blocked_admissions += 1
+                    break
+                num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
+            else:
+                num_tokens = seq.num_tokens - seq.num_cached_tokens
+            if remaining < num_tokens and prefill_seqs:  # only allow chunked prefill for the first seq
+                break
+            if not seq.block_table:
+                self.block_manager.allocate(seq, num_cached_blocks)
+                if seq.first_scheduled_time == 0.0:  # first admission = prefill actually started
+                    seq.first_scheduled_time = now   # (re-fires after a preempt, guard keeps the first)
+            seq.num_scheduled_tokens = min(num_tokens, remaining)
+            num_batched_tokens += seq.num_scheduled_tokens
+            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
+                seq.status = SequenceStatus.RUNNING
+                self.waiting.remove(seq)
+                self.running.append(seq)
+            prefill_seqs.append(seq)
+        return prefill_seqs
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
+        seq.num_preemptions += 1
+        self.total_preemptions += 1
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
-        for seq, token_id in zip(seqs, token_ids):
-            self.block_manager.hash_blocks(seq)
-            seq.num_cached_tokens += seq.num_scheduled_tokens
-            seq.num_scheduled_tokens = 0
-            if is_prefill and seq.num_cached_tokens < seq.num_tokens:
-                continue
-            seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
-                seq.status = SequenceStatus.FINISHED
-                self.block_manager.deallocate(seq)
-                self.running.remove(seq)
+    def postprocess(self, prefill_seqs: list[Sequence], decode_seqs: list[Sequence], token_ids: list[int]):
+        # token_ids order must match model_runner.run(): decode first, then prefill
+        n = len(decode_seqs)
+        for seq, token_id in zip(decode_seqs, token_ids[:n]):
+            self._commit(seq, token_id, is_prefill=False)
+        for seq, token_id in zip(prefill_seqs, token_ids[n:]):
+            self._commit(seq, token_id, is_prefill=True)
+
+    def _commit(self, seq: Sequence, token_id: int, is_prefill: bool):
+        self.block_manager.hash_blocks(seq)
+        seq.num_cached_tokens += seq.num_scheduled_tokens
+        seq.num_scheduled_tokens = 0
+        if is_prefill and seq.num_cached_tokens < seq.num_tokens:
+            return  # chunked prefill not done yet
+        seq.append_token(token_id)
+        if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            seq.status = SequenceStatus.FINISHED
+            self.block_manager.deallocate(seq)
+            self.running.remove(seq)

@@ -39,11 +39,19 @@ class LLMEngine:
         self.submit_time: dict[int, float] = {}
         self.token_times: dict[int, list[float]] = {}
         self._recorded: dict[int, int] = {}
+        # scheduler-internals time series + per-request record (finished seqs are dropped from
+        # scheduler.running, so their fields have to be captured at the moment they finish)
+        self.iter_log: list[dict] = []
+        self.req_log: dict[int, dict] = {}
 
     def reset_metrics(self):
         self.submit_time.clear()
         self.token_times.clear()
         self._recorded.clear()
+        self.iter_log.clear()
+        self.req_log.clear()
+        self.scheduler.total_preemptions = 0
+        self.scheduler.total_blocked_admissions = 0
 
     def exit(self):
         self.model_runner.call("exit")
@@ -62,23 +70,54 @@ class LLMEngine:
             self._recorded[seq.seq_id] = 0
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        t0 = perf_counter()
+        prefill_seqs, decode_seqs = self.scheduler.schedule()
+        num_prefill_tokens = sum(seq.num_scheduled_tokens for seq in prefill_seqs)
+        num_decode_tokens = len(decode_seqs)
+        token_ids = self.model_runner.call("run", prefill_seqs, decode_seqs)
+        self.scheduler.postprocess(prefill_seqs, decode_seqs, token_ids)
 
         # record a timestamp for each newly produced completion token
         if self.collect_metrics:
             now = perf_counter()
-            for seq in seqs:
+            for seq in decode_seqs + prefill_seqs:
                 n = seq.num_completion_tokens
                 rec = self._recorded.get(seq.seq_id, 0)
                 if n > rec:
                     self.token_times[seq.seq_id].extend([now] * (n - rec))
                     self._recorded[seq.seq_id] = n
+            self._record_iteration(now, now - t0, prefill_seqs, decode_seqs, num_prefill_tokens)
 
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        return outputs, num_tokens
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in prefill_seqs + decode_seqs if seq.is_finished]
+        return outputs, num_prefill_tokens, num_decode_tokens
+
+    # one row per engine iteration (batch shape / queue depth / KV occupancy) + the final record of
+    # every seq that finished this iteration
+    def _record_iteration(self, now: float, dt: float, prefill_seqs, decode_seqs, num_prefill_tokens: int):
+        sched = self.scheduler
+        bm = sched.block_manager
+        self.iter_log.append({
+            "t": now,
+            "dt": dt,
+            "n_prefill_seqs": len(prefill_seqs),
+            "n_prefill_tokens": num_prefill_tokens,
+            "n_decode_seqs": len(decode_seqs),
+            "waiting": len(sched.waiting),
+            "running": len(sched.running),
+            "kv_used": len(bm.used_block_ids),
+            "kv_total": len(bm.blocks),
+            "preempt_cum": sched.total_preemptions,
+            "blocked_cum": sched.total_blocked_admissions,
+        })
+        for seq in prefill_seqs + decode_seqs:
+            if seq.is_finished and seq.seq_id not in self.req_log:
+                self.req_log[seq.seq_id] = {
+                    "arrival_time": seq.arrival_time,
+                    "first_scheduled_time": seq.first_scheduled_time,
+                    "num_prompt_tokens": seq.num_prompt_tokens,
+                    "num_completion_tokens": seq.num_completion_tokens,
+                    "num_preemptions": seq.num_preemptions,
+                }
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -98,11 +137,12 @@ class LLMEngine:
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
             t = perf_counter()
-            output, num_tokens = self.step()
-            if num_tokens > 0:
-                prefill_throughput = num_tokens / (perf_counter() - t)
-            else:
-                decode_throughput = -num_tokens / (perf_counter() - t)
+            output, num_prefill_tokens, num_decode_tokens = self.step()
+            dt = perf_counter() - t
+            if num_prefill_tokens:
+                prefill_throughput = num_prefill_tokens / dt
+            if num_decode_tokens:
+                decode_throughput = num_decode_tokens / dt
             pbar.set_postfix({
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",

@@ -34,6 +34,10 @@ class Sequence:
         self.priority = sampling_params.priority
         self.arrival_time = 0.0
 
+        # benchmark instrumentation (rank 0 only, not part of __getstate__)
+        self.first_scheduled_time = 0.0
+        self.num_preemptions = 0
+
     def __len__(self):
         return self.num_tokens
 
