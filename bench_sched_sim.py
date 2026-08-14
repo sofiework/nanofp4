@@ -246,7 +246,7 @@ def _internals(run):
             btok.append(it["n_prefill_tokens"] + it["n_decode_seqs"])
             kv.append(100.0 * it["kv_used"] / it["kv_total"])
             dts.append(it["dt"] * 1000)
-        slopes.append(_queue_slope(its))
+        slopes.append(_queue_slope(its, max(r["arrival_ts"] for r in rep["reqs"])))
     return {
         "throughput": ntok / wall if wall else 0.0,
         "iters": niter,
@@ -265,13 +265,15 @@ def _internals(run):
     }
 
 
-def _queue_slope(iters):
-    """Least-squares slope (waiting seqs per second) over the second half of the run.
+def _queue_slope(iters, t_last_arrival):
+    """Least-squares slope (waiting seqs per second) over the second half of the ARRIVAL window.
 
     ~0 means the backlog is stationary (the engine keeps up); clearly positive means the offered
-    rate exceeds capacity, which is what marks the saturation knee.
+    rate exceeds capacity, which is what marks the saturation knee. Iterations after the last
+    arrival must be excluded: the queue there only drains, which would mask saturation.
     """
-    half = iters[len(iters) // 2:]
+    window = [i for i in iters if i["t"] <= t_last_arrival]
+    half = window[len(window) // 2:]
     if len(half) < 8:
         return 0.0
     n = len(half)
@@ -347,14 +349,19 @@ def compare(raw_path, out_prefix):
         if qa is not None and qn is not None:
             L.append(f"- rate {rate}: **P0 batch max queueing delay** aging {qa:.0f} ms vs "
                      f"no-aging {qn:.0f} ms (starvation bound)")
+    # driver health: the single-threaded replay can only inject between engine steps, so an
+    # injection lag comparable to TTFT means the driver, not the scheduler, sets the latency
     lag = max((r["lag_p99"] for r in rows if r["tier"] == "ALL"), default=0.0)
-    ttft0 = min((r["ttft_p50"] for r in rows if r["tier"] == "ALL"), default=0.0)
-    L.append(f"- driver health: injection lag p99 {lag:.0f} ms vs lowest TTFT p50 {ttft0:.0f} ms "
-             f"({'OK' if lag < 0.2 * max(ttft0, 1) else 'TOO HIGH — the driver is distorting the trace'})")
-    knee = [i for i in internals if i["scheduler"] == "baseline" and i["queue_slope"] < 0.2]
-    if knee:
-        L.append(f"- saturation knee: backlog stays stationary up to **{max(i['rate'] for i in knee)} "
-                 f"req/s** (queue slope < 0.2 req/s on the second half of the run)")
+    bad = [r["rate"] for r in rows if r["tier"] == "ALL" and r["lag_p99"] > 0.2 * max(r["ttft_p50"], 1)]
+    L.append(f"- driver health: injection lag p99 {lag:.0f} ms (~one engine step); "
+             + (f"non-negligible vs TTFT only at rate(s) {sorted(set(bad))}" if bad
+                else "negligible at every rate"))
+    stat = [i for i in internals if i["scheduler"] == "baseline" and i["queue_slope"] < 0.2]
+    grow = [i for i in internals if i["scheduler"] == "baseline" and i["queue_slope"] >= 0.2]
+    if stat:
+        L.append(f"- saturation knee: backlog stationary up to **{max(i['rate'] for i in stat)} req/s**"
+                 + (f", growing from {min(i['rate'] for i in grow)} req/s" if grow else "")
+                 + " (waiting-queue slope over the arrival window)")
 
     open(f"{out_prefix}.md", "w").write("\n".join(L))
     print("\n".join(L))
